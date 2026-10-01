@@ -38,6 +38,10 @@ def scope_member_update(org_id: int) -> str:
     return f"org:{org_id}:member.update"
 
 
+def scope_delegation_create(org_id: int) -> str:
+    return f"org:{org_id}:delegation.create"
+
+
 def fingerprint(raw_body: bytes) -> str:
     """Stable SHA-256 over the JSON body, independent of key ordering.
 
@@ -56,7 +60,7 @@ def find(
 ) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT request_hash, response_status, response_body
+        SELECT request_hash, response_status, response_body, delegation_id
         FROM idempotency_keys
         WHERE operator_id = ? AND scope = ? AND idempotency_key = ?
         """,
@@ -78,6 +82,7 @@ def store_encrypted(
     status_code: int,
     response_body: dict[str, Any],
     ts: int,
+    delegation_id: Optional[int] = None,
 ) -> None:
     # UNIQUE(operator_id, scope, idempotency_key): a concurrent retry that
     # beats us here raises IntegrityError; the caller rolls back and replays.
@@ -85,8 +90,8 @@ def store_encrypted(
         """
         INSERT INTO idempotency_keys
             (operator_id, scope, idempotency_key, request_hash,
-             response_status, response_body, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+             response_status, response_body, delegation_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             operator_id,
@@ -95,6 +100,7 @@ def store_encrypted(
             request_hash,
             status_code,
             encrypt_text(json.dumps(response_body, ensure_ascii=False)),
+            delegation_id,
             ts,
         ),
     )

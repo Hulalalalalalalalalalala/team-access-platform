@@ -64,9 +64,28 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at      INTEGER NOT NULL,
     used_at         INTEGER,
     used_by         INTEGER REFERENCES users(id),
-    revoked_at      INTEGER
+    revoked_at      INTEGER,
+    delegation_id   INTEGER REFERENCES delegations(id)  -- set when issued by a delegate
 );
 CREATE INDEX IF NOT EXISTS idx_invites_user ON invites(invite_username);
+
+-- Temporary delegation of invite management: an active admin grants one
+-- active plain member the power to issue/revoke member invites for a
+-- bounded time. At most one ACTIVE delegation per (org, delegate).
+CREATE TABLE IF NOT EXISTS delegations (
+    id          INTEGER PRIMARY KEY,
+    org_id      INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    grantor_id  INTEGER NOT NULL REFERENCES users(id),
+    delegate_id INTEGER NOT NULL REFERENCES users(id),
+    status      TEXT NOT NULL CHECK (status IN ('active','expired','revoked','invalidated')),
+    reason      TEXT,               -- 'expired' / 'revoked' / 'grantor_not_active_admin' / 'delegate_not_active_member'
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    ended_at    INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_one_active
+    ON delegations(org_id, delegate_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_delegations_delegate ON delegations(org_id, delegate_id);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id         INTEGER PRIMARY KEY,
@@ -99,6 +118,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     request_hash    TEXT NOT NULL,          -- sha256 of canonical request body
     response_status INTEGER NOT NULL,
     response_body   TEXT NOT NULL,          -- JSON of the first successful response
+    delegation_id   INTEGER,                -- delegation that authorized the original call
     created_at      INTEGER NOT NULL,
     UNIQUE (operator_id, scope, idempotency_key)
 );
@@ -138,6 +158,17 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Idempotent migration: add ``column`` to ``table`` when missing.
+
+    Needed so databases created by older versions pick up the delegation
+    columns on restart (CREATE TABLE IF NOT EXISTS leaves them untouched).
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db() -> None:
     global _initialized
     with _init_lock:
@@ -148,6 +179,10 @@ def init_db() -> None:
         try:
             conn.executescript(SCHEMA)
             conn.execute(FAIL_TRIGGER)
+            _ensure_column(conn, "invites", "delegation_id",
+                           "delegation_id INTEGER REFERENCES delegations(id)")
+            _ensure_column(conn, "idempotency_keys", "delegation_id",
+                           "delegation_id INTEGER")
         finally:
             conn.close()
         _initialized = True

@@ -23,6 +23,22 @@
 - **成员管理**：改角色、停用、恢复在下一次请求立即生效；停用者该组织的**所有会话**
   立即失去该组织访问权，其他组织不受影响；禁止停用 / 降级最后一个启用管理员
   （包括对自己操作）→ `409 last_admin_required`，并发降级 / 停用同样满足该约束。
+- **临时委托邀请管理**：启用管理员可将本组织邀请管理临时委托给一名启用的普通成员：
+  - 创建 `POST /orgs/{org_id}/delegations`（支持幂等键）：指定 `user_id` 与
+    `ttl_seconds`（60–86400 的整数，否则 `422 validation_error`）；目标不存在、
+    已停用或不是普通成员 → `409 ineligible_member`；同一成员最多一份有效委托，
+    重复授予（含并发）→ `409 delegation_exists`；受托人角色仍为 `member`。
+  - 受托人在有效期内沿用现有入口签发 `member` 邀请、撤销**凭该委托**签发的邀请；
+    签发 `admin` 邀请、撤销他人或其他委托的邀请、调整成员、读审计、再委托 →
+    统一 `403 forbidden`。委托不计入最后一个管理员约束；委托失效不影响已签发邀请。
+  - 查询 `GET /orgs/{org_id}/delegations`：管理员见全部，普通成员仅见自己的；
+    状态含 `active` / `expired` / `revoked` / `invalidated` 及原因。
+    撤销 `POST /orgs/{org_id}/delegations/{id}/revoke`：仅管理员；不存在或其他组织
+    → `404 not_found`；重复撤销成功且不重复记审计。
+  - 到期时刻起不再授权；授予人不再是启用管理员或受托人不再是启用普通成员时，
+    委托**永久失效**（`invalidated`，恢复角色也不复活），只能重新授予。
+  - 委托创建 / 撤销 / 成员变化失效与受托邀请操作均入审计（含关联委托与前后状态）；
+    委托签发邀请的幂等重试仍绑定原委托，原委托失效后重放返回 `403`（即使有新委托）。
 - **审计**：组织、邀请、成员的每一次变更与审计行在**同一事务原子提交**，失败无部分写入；
   审计包含组织、操作者、动作、对象、时间戳及前后状态；仅本组织管理员可分页查询，
   不提供任何修改或删除接口。
@@ -125,10 +141,13 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 | GET | `/orgs` | 登录用户 | — |
 | GET | `/orgs/{org_id}/members` | 本组织启用成员 | — |
 | GET | `/orgs/{org_id}/members/me` | 本组织启用成员 | — |
-| POST | `/orgs/{org_id}/invites` | 本组织管理员 | ✔（按组织隔离） |
-| POST | `/orgs/{org_id}/invites/revoke` | 本组织管理员 | — |
+| POST | `/orgs/{org_id}/invites` | 本组织管理员或有效受托人（仅 member 邀请） | ✔（按组织隔离） |
+| POST | `/orgs/{org_id}/invites/revoke` | 本组织管理员或签发该邀请的有效受托人 | — |
 | POST | `/invites/accept` | 登录用户 | — |
 | PATCH | `/orgs/{org_id}/members/{user_id}` | 本组织管理员 | ✔（按组织隔离） |
+| POST | `/orgs/{org_id}/delegations` | 本组织管理员 | ✔（按组织隔离） |
+| GET | `/orgs/{org_id}/delegations` | 本组织启用成员（管理员见全部，成员仅见自己） | — |
+| POST | `/orgs/{org_id}/delegations/{id}/revoke` | 本组织管理员 | — |
 | GET | `/orgs/{org_id}/audit?page=&page_size=` | 本组织管理员 | — |
 
 ## 错误响应
@@ -150,6 +169,8 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 | 409 | `invite_unavailable` | 邀请不存在 / 过期 / 已撤销 / 已使用 / 并发竞争失败 |
 | 409 | `already_member` | 已有成员再接受邀请（不覆盖角色 / 状态） |
 | 409 | `last_admin_required` | 停用 / 降级最后一个启用管理员（含自我操作、并发竞争） |
+| 409 | `ineligible_member` | 委托目标不存在 / 已停用 / 不是普通成员 |
+| 409 | `delegation_exists` | 该成员在本组织已有一份有效委托（含并发授予） |
 | 409 | `idempotency_conflict` | 同幂等键但请求体不同 |
 | 404 | `not_found` / `member_not_found` | 路由不存在 / 目标成员不存在 |
 | 422 | `validation_error` | 请求体不合法 |
@@ -173,11 +194,14 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 
 ```bash
 ./.venv/bin/python -m pytest -q
-# 42 passed
+# 63 passed
 ```
 
 覆盖范围：注册 / 登录 / 退出与多会话隔离、重复用户名、统一 401/403、角色权限隔离、
 停用即时失权与跨组织不受影响、邀请四种不可用状态与校验顺序、并发接受仅一次成功、
 已是成员不覆盖、最后管理员（含并发降级）、审计内容 / 分页 / 组织隔离 / 只读、
 幂等重放 / 冲突 / 权限重校 / 并发一次变更 / 失败不缓存、事务回滚无部分写入、
-明文秘密不落盘不入日志、重启后数据 / 会话 / 审计 / 幂等记录全部保留。
+明文秘密不落盘不入日志、重启后数据 / 会话 / 审计 / 幂等记录全部保留；
+委托授予校验（422/409）、唯一有效委托（含并发）、受托签发 / 撤销范围与统一 403、
+到期与成员变化永久失效、委托查询 / 撤销语义、委托幂等与重放绑定原委托、
+委托审计与重启持久化。

@@ -53,3 +53,9 @@ class AcceptInviteRequest(BaseModel):
 class UpdateMemberRequest(BaseModel):
     role: Optional[Literal["admin", "member"]] = None
     status: Optional[Literal["active", "disabled"]] = None
+
+
+class CreateDelegationRequest(BaseModel):
+    user_id: int = Field(ge=1)
+    # Strict int: floats/strings are rejected with 422 validation_error.
+    ttl_seconds: int = Field(strict=True, ge=60, le=86400)
