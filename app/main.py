@@ -28,6 +28,7 @@ import json
 import logging
 import re
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
 
@@ -46,6 +47,7 @@ from .errors import (
 )
 from .schemas import (
     AcceptInviteRequest,
+    BatchUpdateMembersRequest,
     CreateDelegationRequest,
     CreateInviteRequest,
     CreateOrgRequest,
@@ -520,6 +522,68 @@ def _invalidate_delegations_for_member_change(
         )
 
 
+def _invalidate_delegations_for_member_changes(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    changes: list[tuple[int, str, str]],
+    actor_id: int,
+    ts: int,
+    batch_id: Optional[str] = None,
+) -> None:
+    """Invalidate active delegations affected by a BATCH of member changes.
+
+    ``changes`` is a list of ``(target_user_id, new_role, new_status)`` for
+    the members whose role/status actually changed. A single delegation can
+    be hit by more than one change in the same batch (its grantor and its
+    delegate both lose eligibility): it is then invalidated exactly ONCE,
+    with both reasons joined (``grantor_not_admin,delegate_ineligible``).
+
+    Runs in the SAME transaction as the member changes, so the changes and
+    the invalidation audits commit atomically. Invalidation is permanent:
+    later restoring role/status never revives a dead delegation.
+    """
+    reasons_by_id: dict[int, list[str]] = {}
+    triggered_by: dict[int, list[int]] = {}
+    for target_user_id, new_role, new_status in changes:
+        rows = c.execute(
+            """
+            SELECT d.id, d.grantor_id, d.delegate_id
+            FROM delegations d
+            WHERE d.org_id = ? AND d.status = 'active'
+              AND (d.grantor_id = ? OR d.delegate_id = ?)
+            """,
+            (org_id, target_user_id, target_user_id),
+        ).fetchall()
+        for r in rows:
+            reasons = reasons_by_id.setdefault(r["id"], [])
+            triggers = triggered_by.setdefault(r["id"], [])
+            if r["grantor_id"] == target_user_id and (new_role != "admin" or new_status != "active"):
+                if "grantor_not_admin" not in reasons:
+                    reasons.append("grantor_not_admin")
+            if r["delegate_id"] == target_user_id and (new_role != "member" or new_status != "active"):
+                if "delegate_ineligible" not in reasons:
+                    reasons.append("delegate_ineligible")
+            if target_user_id not in triggers:
+                triggers.append(target_user_id)
+
+    for d_id, reasons in reasons_by_id.items():
+        reason = ",".join(reasons)
+        c.execute(
+            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
+            " WHERE id = ?",
+            (reason, ts, d_id),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
+            target_type="delegation", target_id=d_id,
+            before={"status": "active"},
+            after={"status": "invalidated", "reason": reason,
+                   "triggered_by": sorted(triggered_by[d_id])},
+            ts=ts, batch_id=batch_id,
+        )
+
+
 @app.post("/orgs/{org_id}/delegations", status_code=201)
 def create_delegation(
     org_id: int,
@@ -867,6 +931,142 @@ def accept_invite(
 
 # ========================================================== member management
 
+@app.patch("/orgs/{org_id}/members/batch")
+def batch_update_members(
+    org_id: int,
+    body: BatchUpdateMembersRequest,
+    request_body: bytes = Depends(raw_body),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+) -> dict[str, Any]:
+    """Batch role/status changes for members of one organization.
+
+    * 1..100 changes, each a positive ``user_id`` plus at least one of
+      ``role`` / ``status``; fields left out keep their current value.
+    * Only active administrators of THIS organization may call it; trustees
+      (delegates) have no access. Non-members / disabled members / requests
+      against a non-existent org all get the uniform 403.
+    * Any target that is not a member of this org fails the WHOLE batch with
+      404 ``member_not_found`` (no partial write, no leak about other orgs).
+    * The last-active-admin invariant is evaluated over the FINAL state of
+      the whole org, so promoting one member while demoting/disabling an
+      existing admin in the same batch succeeds regardless of order.
+    * The initiator may demote/disable themselves; access is re-checked on
+      every subsequent request, so the new identity takes effect at once.
+    * Member changes and the delegation invalidations they trigger are
+      audited separately, all sharing one ``batch_id``.
+    """
+    # Duplicate members within one batch are a validation error (raised
+    # before the idempotency machinery, so it never consumes a key).
+    seen: set[int] = set()
+    for ch in body.changes:
+        if ch.user_id in seen:
+            raise ApiError(422, "validation_error", "duplicate member in changes")
+        seen.add(ch.user_id)
+
+    def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        user_ids = [ch.user_id for ch in body.changes]
+        placeholders = ",".join("?" for _ in user_ids)
+
+        # Load every target membership in one query; any missing user is not
+        # a member of THIS org -> whole batch 404 member_not_found.
+        rows = c.execute(
+            f"""
+            SELECT m.*, u.username
+            FROM memberships m JOIN users u ON u.id = m.user_id
+            WHERE m.org_id = ? AND m.user_id IN ({placeholders})
+            """,
+            (org_id, *user_ids),
+        ).fetchall()
+        by_id = {r["user_id"]: r for r in rows}
+        for ch in body.changes:
+            if ch.user_id not in by_id:
+                raise not_found("member_not_found", "member not found")
+
+        # Compute the intended new state for every change.
+        plan: list[tuple[Any, sqlite3.Row, str, str, bool]] = []
+        for ch in body.changes:
+            m = by_id[ch.user_id]
+            new_role = ch.role if ch.role is not None else m["role"]
+            new_status = ch.status if ch.status is not None else m["status"]
+            changed = new_role != m["role"] or new_status != m["status"]
+            plan.append((ch, m, new_role, new_status, changed))
+
+        # Last-active-admin invariant over the FINAL state of the whole org.
+        # Unchanged members keep their current role/status; the count must
+        # leave at least one active admin. This is order-independent and is
+        # evaluated while holding the IMMEDIATE write lock, so concurrent
+        # single/batch changes cannot both slip past it.
+        final_by_id = {m["user_id"]: (new_role, new_status)
+                       for _ch, m, new_role, new_status, _changed in plan}
+        all_members = c.execute(
+            "SELECT user_id, role, status FROM memberships WHERE org_id = ?",
+            (org_id,),
+        ).fetchall()
+        active_admins_after = 0
+        for r in all_members:
+            if r["user_id"] in final_by_id:
+                nr, ns = final_by_id[r["user_id"]]
+            else:
+                nr, ns = r["role"], r["status"]
+            if nr == "admin" and ns == "active":
+                active_admins_after += 1
+        if active_admins_after == 0:
+            raise conflict(
+                "last_admin_required",
+                "organization must retain at least one active administrator",
+            )
+
+        batch_id = uuid.uuid4().hex
+        changed_changes: list[tuple[int, str, str]] = []
+        for _ch, m, new_role, new_status, changed in plan:
+            if not changed:
+                # Unchanged members are returned but neither updated nor
+                # audited (updated_at stays untouched).
+                continue
+            c.execute(
+                "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
+                " WHERE id = ?",
+                (new_role, new_status, ts, m["id"]),
+            )
+            add_audit(
+                c, org_id=org_id, actor_id=user.id, action="member.updated",
+                target_type="membership", target_id=m["id"],
+                before={"role": m["role"], "status": m["status"]},
+                after={"role": new_role, "status": new_status},
+                ts=ts, batch_id=batch_id,
+            )
+            changed_changes.append((m["user_id"], new_role, new_status))
+
+        # Delegation invalidations share the transaction and the batch id.
+        _invalidate_delegations_for_member_changes(
+            c, org_id=org_id, changes=changed_changes,
+            actor_id=user.id, ts=ts, batch_id=batch_id,
+        )
+
+        # Return final member info in SUBMISSION order, including no-ops.
+        after_rows = c.execute(
+            f"""
+            SELECT m.org_id, m.user_id, u.username, m.role, m.status,
+                   m.created_at, m.updated_at
+            FROM memberships m JOIN users u ON u.id = m.user_id
+            WHERE m.org_id = ? AND m.user_id IN ({placeholders})
+            """,
+            (org_id, *user_ids),
+        ).fetchall()
+        after_by_id = {r["user_id"]: r for r in after_rows}
+        members = [membership_dict(after_by_id[ch.user_id]) for ch in body.changes]
+        return 200, {"batch_id": batch_id, "members": members}
+
+    _, resp = _run_idempotent(
+        conn, user, idempotency.scope_member_batch_update(org_id), idempotency_key, request_body,
+        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        perform=_perform,
+    )
+    return resp
+
+
 @app.patch("/orgs/{org_id}/members/{target_user_id}")
 def update_member(
     org_id: int,
@@ -993,6 +1193,7 @@ def list_audit(
             "target_id": r["target_id"],
             "before": json.loads(r["before_state"]) if r["before_state"] else None,
             "after": json.loads(r["after_state"]) if r["after_state"] else None,
+            "batch_id": r["batch_id"],
         }
         for r in rows
     ]

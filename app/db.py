@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     target_id   TEXT,
     before_state TEXT,                      -- JSON snapshot, nullable
     after_state  TEXT,                      -- JSON snapshot, nullable
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    batch_id   TEXT                         -- shared by a batch's audits, nullable
 );
 CREATE INDEX IF NOT EXISTS idx_audit_org_time ON audit_logs(org_id, id);
 
@@ -177,6 +178,11 @@ def init_db() -> None:
                     "ALTER TABLE invites ADD COLUMN delegation_id "
                     "INTEGER REFERENCES delegations(id) ON DELETE SET NULL"
                 )
+            # Migration for databases created before batch audits existed:
+            # add audit_logs.batch_id if it is missing.
+            acols = [r[1] for r in conn.execute("PRAGMA table_info(audit_logs)")]
+            if "batch_id" not in acols:
+                conn.execute("ALTER TABLE audit_logs ADD COLUMN batch_id TEXT")
         finally:
             conn.close()
         _initialized = True

@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 
@@ -59,3 +59,26 @@ class CreateDelegationRequest(BaseModel):
     # strict int: floats / strings / booleans are 422, not silently coerced.
     user_id: int
     duration_seconds: int = Field(ge=60, le=86400, strict=True)
+
+
+class BatchMemberChange(BaseModel):
+    """One item of a batch member update.
+
+    ``user_id`` must be a positive integer (strict: floats/strings/booleans
+    are 422, not silently coerced). At least one of ``role`` / ``status``
+    must be present; an item carrying neither is a validation error.
+    """
+
+    user_id: int = Field(gt=0, strict=True)
+    role: Optional[Literal["admin", "member"]] = None
+    status: Optional[Literal["active", "disabled"]] = None
+
+    @model_validator(mode="after")
+    def _role_or_status_required(self) -> "BatchMemberChange":
+        if self.role is None and self.status is None:
+            raise ValueError("role or status is required")
+        return self
+
+
+class BatchUpdateMembersRequest(BaseModel):
+    changes: list[BatchMemberChange] = Field(min_length=1, max_length=100)

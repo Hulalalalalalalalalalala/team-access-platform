@@ -31,6 +31,7 @@ def add_audit(
     before: Any = None,
     after: Any = None,
     ts: int,
+    batch_id: Optional[str] = None,
 ) -> None:
     # The BEFORE INSERT trigger (see db.FAIL_TRIGGER) can abort this INSERT
     # when fault injection is armed, rolling back the entire transaction.
@@ -38,8 +39,8 @@ def add_audit(
         """
         INSERT INTO audit_logs
             (org_id, actor_id, action, target_type, target_id,
-             before_state, after_state, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             before_state, after_state, created_at, batch_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             org_id,
@@ -50,5 +51,6 @@ def add_audit(
             _json(before),
             _json(after),
             ts,
+            batch_id,
         ),
     )
