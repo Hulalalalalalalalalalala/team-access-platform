@@ -55,6 +55,21 @@ class UpdateMemberRequest(BaseModel):
     status: Optional[Literal["active", "disabled"]] = None
 
 
+class BatchMemberChange(BaseModel):
+    # Strict positive integer: floats/strings/booleans are 422, not silently
+    # coerced; role/status reuse the single-entry values.
+    user_id: int = Field(gt=0, strict=True)
+    role: Optional[Literal["admin", "member"]] = None
+    status: Optional[Literal["active", "disabled"]] = None
+
+
+class BatchUpdateMembersRequest(BaseModel):
+    # 1..100 changes per batch; cross-item rules (duplicates, items without
+    # any adjustment field) are checked in the endpoint so they share the
+    # stable 422 validation_error envelope.
+    changes: list[BatchMemberChange] = Field(min_length=1, max_length=100)
+
+
 class CreateDelegationRequest(BaseModel):
     # strict int: floats / strings / booleans are 422, not silently coerced.
     user_id: int

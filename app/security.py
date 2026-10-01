@@ -55,6 +55,11 @@ def generate_invite_token() -> str:
     return os.urandom(config.INVITE_TOKEN_BYTES).hex()
 
 
+def generate_batch_id() -> str:
+    # Opaque batch marker shared by every audit row of one batch operation.
+    return "b_" + os.urandom(16).hex()
+
+
 def hash_token(token: str) -> str:
     """Tokens are stored and compared only as SHA-256 hashes."""
     return hashlib.sha256(token.encode("ascii")).hexdigest()

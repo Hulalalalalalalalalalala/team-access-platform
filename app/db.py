@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     target_id   TEXT,
     before_state TEXT,                      -- JSON snapshot, nullable
     after_state  TEXT,                      -- JSON snapshot, nullable
+    batch_id   TEXT,                        -- set for rows produced by a batch op
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_org_time ON audit_logs(org_id, id);
@@ -177,6 +178,9 @@ def init_db() -> None:
                     "ALTER TABLE invites ADD COLUMN delegation_id "
                     "INTEGER REFERENCES delegations(id) ON DELETE SET NULL"
                 )
+            audit_cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_logs)")]
+            if "batch_id" not in audit_cols:
+                conn.execute("ALTER TABLE audit_logs ADD COLUMN batch_id TEXT")
         finally:
             conn.close()
         _initialized = True

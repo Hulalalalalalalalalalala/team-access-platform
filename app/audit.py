@@ -30,6 +30,7 @@ def add_audit(
     target_id: Optional[str] = None,
     before: Any = None,
     after: Any = None,
+    batch_id: Optional[str] = None,
     ts: int,
 ) -> None:
     # The BEFORE INSERT trigger (see db.FAIL_TRIGGER) can abort this INSERT
@@ -38,8 +39,8 @@ def add_audit(
         """
         INSERT INTO audit_logs
             (org_id, actor_id, action, target_type, target_id,
-             before_state, after_state, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             before_state, after_state, batch_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             org_id,
@@ -49,6 +50,7 @@ def add_audit(
             None if target_id is None else str(target_id),
             _json(before),
             _json(after),
+            batch_id,
             ts,
         ),
     )

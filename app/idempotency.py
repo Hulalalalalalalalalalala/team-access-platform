@@ -5,7 +5,9 @@ safely be reused across different operations:
 
 * ``org.create``                 -- organization creation
 * ``org:<id>:invite.create``     -- issuing an invite in a specific org
-* ``org:<id>:member.update``     -- changing a member role/status in an org
+* ``org:<id>:member.update``     -- changing one member's role/status in an org
+* ``org:<id>:member.batch_update`` -- batch member changes (own scope, never
+  shares keys with the single-member entry point)
 
 A stored record captures the fingerprint of the request body and the first
 *successful* response. Replays with the same key+body return the stored
@@ -36,6 +38,12 @@ def scope_invite_create(org_id: int) -> str:
 
 def scope_member_update(org_id: int) -> str:
     return f"org:{org_id}:member.update"
+
+
+def scope_member_batch_update(org_id: int) -> str:
+    # Distinct from the single-member scope so the two entry points never
+    # consume each other's keys.
+    return f"org:{org_id}:member.batch_update"
 
 
 def scope_delegation_create(org_id: int) -> str:

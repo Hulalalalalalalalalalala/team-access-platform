@@ -12,6 +12,7 @@ Organizations
   GET  /orgs                 list the caller's organizations
   GET  /orgs/{org_id}/members                 active members: roster
   GET  /orgs/{org_id}/members/me              own membership state
+  PATCH /orgs/{org_id}/members/batch          batch role/status change [idempotent]
   PATCH /orgs/{org_id}/members/{user_id}      role/status change   [idempotent]
 
 Invitations
@@ -46,6 +47,7 @@ from .errors import (
 )
 from .schemas import (
     AcceptInviteRequest,
+    BatchUpdateMembersRequest,
     CreateDelegationRequest,
     CreateInviteRequest,
     CreateOrgRequest,
@@ -55,6 +57,7 @@ from .schemas import (
     UpdateMemberRequest,
 )
 from .security import (
+    generate_batch_id,
     generate_invite_token,
     generate_session_token,
     hash_password,
@@ -520,6 +523,67 @@ def _invalidate_delegations_for_member_change(
         )
 
 
+def _invalidate_delegations_for_batch(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    new_states: dict[int, tuple[str, str]],
+    actor_id: int,
+    batch_id: str,
+    ts: int,
+) -> None:
+    """Invalidate active delegations affected by a batch member change.
+
+    ``new_states`` maps user_id -> (new_role, new_status) for members that
+    actually changed. Commits in the SAME transaction as the batch, so the
+    member changes and every invalidation row live or die together. When one
+    delegation's grantor AND delegate both lose eligibility in the same
+    batch, exactly ONE invalidation row is written carrying BOTH reasons.
+    Invalidation is permanent: restoring members in a later batch never
+    revives anything.
+    """
+    if not new_states:
+        return
+    rows = c.execute(
+        """
+        SELECT d.id, d.grantor_id, d.delegate_id
+        FROM delegations d
+        WHERE d.org_id = ? AND d.status = 'active'
+        """,
+        (org_id,),
+    ).fetchall()
+    for r in rows:
+        reasons: list[str] = []
+        triggered: list[int] = []
+        g_state = new_states.get(r["grantor_id"])
+        if g_state is not None:
+            if g_state[0] != "admin" or g_state[1] != "active":
+                reasons.append("grantor_not_admin")
+                triggered.append(r["grantor_id"])
+        d_state = new_states.get(r["delegate_id"])
+        if d_state is not None:
+            if d_state[0] != "member" or d_state[1] != "active":
+                reasons.append("delegate_ineligible")
+                if r["delegate_id"] not in triggered:
+                    triggered.append(r["delegate_id"])
+        if not reasons:
+            continue
+        reason = ",".join(reasons)
+        c.execute(
+            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
+            " WHERE id = ?",
+            (reason, ts, r["id"]),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
+            target_type="delegation", target_id=r["id"],
+            before={"status": "active"},
+            after={"status": "invalidated", "reason": reason,
+                   "triggered_by": triggered},
+            batch_id=batch_id, ts=ts,
+        )
+
+
 @app.post("/orgs/{org_id}/delegations", status_code=201)
 def create_delegation(
     org_id: int,
@@ -867,6 +931,119 @@ def accept_invite(
 
 # ========================================================== member management
 
+@app.patch("/orgs/{org_id}/members/batch")
+def batch_update_members(
+    org_id: int,
+    body: BatchUpdateMembersRequest,
+    request_body: bytes = Depends(raw_body),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+) -> dict[str, Any]:
+    # Cross-item validation (item shape/enums and the 1..100 bound are already
+    # enforced by pydantic -> same stable 422 envelope). These checks run
+    # before authorization, matching the single-member entry point.
+    seen: set[int] = set()
+    for ch in body.changes:
+        if ch.role is None and ch.status is None:
+            raise ApiError(422, "validation_error", "role or status is required")
+        if ch.user_id in seen:
+            raise ApiError(422, "validation_error", "duplicate user_id in changes")
+        seen.add(ch.user_id)
+
+    def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        # Load every target first; a target outside THIS organization fails
+        # the whole batch with 404 and reveals nothing about other orgs.
+        ordered: list[tuple[sqlite3.Row, str, str]] = []
+        for ch in body.changes:
+            m = c.execute(
+                """
+                SELECT m.*, u.username FROM memberships m JOIN users u ON u.id = m.user_id
+                WHERE m.org_id = ? AND m.user_id = ?
+                """,
+                (org_id, ch.user_id),
+            ).fetchone()
+            if m is None:
+                raise not_found("member_not_found", "member not found")
+            new_role = ch.role or m["role"]
+            new_status = ch.status or m["status"]
+            ordered.append((m, new_role, new_status))
+
+        # Order-independent last-active-admin invariant. Count active admins
+        # that are untouched by the batch, then add targeted members whose
+        # FINAL state is an active admin (a promotion in the same batch can
+        # offset a demotion regardless of list order).
+        total_active_admins = c.execute(
+            "SELECT COUNT(*) AS n FROM memberships"
+            " WHERE org_id = ? AND role = 'admin' AND status = 'active'",
+            (org_id,),
+        ).fetchone()["n"]
+        targeted_active_admins = sum(
+            1 for m, _, _ in ordered if m["role"] == "admin" and m["status"] == "active"
+        )
+        surviving_targeted = sum(
+            1 for _, nr, ns in ordered if nr == "admin" and ns == "active"
+        )
+        untouched_admins = total_active_admins - targeted_active_admins
+        if untouched_admins + surviving_targeted == 0:
+            raise conflict(
+                "last_admin_required",
+                "organization must retain at least one active administrator",
+            )
+
+        batch_id = generate_batch_id()
+        changed_states: dict[int, tuple[str, str]] = {}
+        for m, new_role, new_status in ordered:
+            before = {"role": m["role"], "status": m["status"]}
+            if new_role != m["role"] or new_status != m["status"]:
+                # Unchanged members are returned but keep updated_at and get
+                # no audit row.
+                c.execute(
+                    "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
+                    " WHERE id = ?",
+                    (new_role, new_status, ts, m["id"]),
+                )
+                changed_states[m["user_id"]] = (new_role, new_status)
+                add_audit(
+                    c, org_id=org_id, actor_id=user.id, action="member.updated",
+                    target_type="membership", target_id=m["id"],
+                    before=before, after={"role": new_role, "status": new_status},
+                    batch_id=batch_id, ts=ts,
+                )
+
+        # Delegation invalidation commits in the SAME transaction; one row
+        # per affected active delegation even when both parties lose
+        # eligibility in this batch.
+        _invalidate_delegations_for_batch(
+            c, org_id=org_id, new_states=changed_states,
+            actor_id=user.id, batch_id=batch_id, ts=ts,
+        )
+
+        # Final member info in SUBMISSION order.
+        final_rows: dict[int, sqlite3.Row] = {}
+        rows = c.execute(
+            """
+            SELECT m.org_id, m.user_id, u.username, m.role, m.status,
+                   m.created_at, m.updated_at
+            FROM memberships m JOIN users u ON u.id = m.user_id
+            WHERE m.org_id = ?
+            """,
+            (org_id,),
+        ).fetchall()
+        for r in rows:
+            final_rows[r["user_id"]] = r
+        members_out = [membership_dict(final_rows[ch.user_id]) for ch in body.changes]
+        return 200, {"batch_id": batch_id, "members": members_out}
+
+    _, resp = _run_idempotent(
+        conn, user, idempotency.scope_member_batch_update(org_id),
+        idempotency_key, request_body,
+        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        perform=_perform,
+    )
+    return resp
+
+
 @app.patch("/orgs/{org_id}/members/{target_user_id}")
 def update_member(
     org_id: int,
@@ -993,6 +1170,7 @@ def list_audit(
             "target_id": r["target_id"],
             "before": json.loads(r["before_state"]) if r["before_state"] else None,
             "after": json.loads(r["after_state"]) if r["after_state"] else None,
+            "batch_id": r["batch_id"],
         }
         for r in rows
     ]
