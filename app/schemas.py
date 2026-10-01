@@ -53,3 +53,9 @@ class AcceptInviteRequest(BaseModel):
 class UpdateMemberRequest(BaseModel):
     role: Optional[Literal["admin", "member"]] = None
     status: Optional[Literal["active", "disabled"]] = None
+
+
+class CreateDelegationRequest(BaseModel):
+    # strict int: floats / strings / booleans are 422, not silently coerced.
+    user_id: int
+    duration_seconds: int = Field(ge=60, le=86400, strict=True)

@@ -38,6 +38,10 @@ def scope_member_update(org_id: int) -> str:
     return f"org:{org_id}:member.update"
 
 
+def scope_delegation_create(org_id: int) -> str:
+    return f"org:{org_id}:delegation.create"
+
+
 def fingerprint(raw_body: bytes) -> str:
     """Stable SHA-256 over the JSON body, independent of key ordering.
 

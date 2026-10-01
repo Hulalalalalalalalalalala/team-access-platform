@@ -40,11 +40,13 @@ from .db import get_conn, init_db, transaction
 from .errors import (
     ApiError,
     conflict,
+    forbidden,
     install_exception_handlers,
     not_found,
 )
 from .schemas import (
     AcceptInviteRequest,
+    CreateDelegationRequest,
     CreateInviteRequest,
     CreateOrgRequest,
     LoginRequest,
@@ -192,12 +194,17 @@ def _run_idempotent(
     body: bytes,
     check_perm: Callable[[sqlite3.Connection], None],
     perform: Callable[[sqlite3.Connection, int], tuple[int, dict[str, Any]]],
+    replay_check: Optional[Callable[[sqlite3.Connection, sqlite3.Row], None]] = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute ``perform`` with Idempotency-Key semantics inside one txn.
 
     * same operator + scope + key + same body -> stored first success
     * same key, different body                -> 409 idempotency_conflict
     * permission is re-checked on every attempt, including stored replays
+    * ``replay_check`` (when given) runs on a stored replay after the
+      permission check, so an operation that was authorized at creation
+      time can be re-authorized against current state (e.g. the delegation
+      that backed an invite must still be active on replay)
     * business change, audit row and idempotency row commit atomically
     """
     if not key:
@@ -213,6 +220,8 @@ def _run_idempotent(
                 "idempotency_conflict",
                 "Idempotency-Key was already used with a different request",
             )
+        if replay_check is not None:
+            replay_check(conn, row)
         return row["response_status"], idempotency.replay_body(row)
 
     class _KeyRace(Exception):
@@ -363,6 +372,299 @@ def my_membership(
     return {"membership": membership_dict(row)}
 
 
+# ================================================================ delegations
+
+DELEGATION_DURATION_MIN = 60
+DELEGATION_DURATION_MAX = 86400
+
+
+def delegation_dict(
+    row: sqlite3.Row,
+    *,
+    grantor_username: Optional[str] = None,
+    delegate_username: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "org_id": row["org_id"],
+        "grantor_id": row["grantor_id"],
+        "delegate_id": row["delegate_id"],
+        "grantor_username": grantor_username,
+        "delegate_username": delegate_username,
+        "status": row["status"],
+        "reason": row["invalid_reason"],
+        "starts_at": row["starts_at"],
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "revoked_at": row["revoked_at"],
+        "revoked_by": row["revoked_by"],
+    }
+
+
+def _active_delegation(c: sqlite3.Connection, org_id: int, user_id: int, ts: int) -> sqlite3.Row:
+    """Return the caller's currently active delegation or raise 403.
+
+    A delegation is active only while status is ``active`` AND the expiry
+    instant has not arrived; from the expiry moment on it authorizes nothing.
+    """
+    d = c.execute(
+        """
+        SELECT * FROM delegations
+        WHERE org_id = ? AND delegate_id = ? AND status = 'active'
+        """,
+        (org_id, user_id),
+    ).fetchone()
+    if d is None or d["expires_at"] <= ts:
+        raise forbidden()
+    return d
+
+
+def _sweep_delegations(c: sqlite3.Connection, org_id: int, ts: int) -> None:
+    """Lazy maintenance, called inside write transactions.
+
+    * time expiry: active delegations past their expiry become ``expired``
+      (automatic, no audit row);
+    * eligibility: an active delegation whose grantor is no longer an active
+      admin, or whose delegate is no longer an active ordinary member, is
+      permanently ``invalidated``. The PATCH member endpoint performs the
+      primary, actor-bearing invalidation; this sweep is the safety net for
+      state changes that bypass it (e.g. direct on-disk manipulation), and
+      it records the invalidation with a NULL actor.
+    """
+    c.execute(
+        "UPDATE delegations SET status = 'expired'"
+        " WHERE org_id = ? AND status = 'active' AND expires_at <= ?",
+        (org_id, ts),
+    )
+    rows = c.execute(
+        """
+        SELECT d.id,
+               gm.role AS g_role, gm.status AS g_status,
+               dm.role AS d_role, dm.status AS d_status
+        FROM delegations d
+        LEFT JOIN memberships gm
+               ON gm.org_id = d.org_id AND gm.user_id = d.grantor_id
+        LEFT JOIN memberships dm
+               ON dm.org_id = d.org_id AND dm.user_id = d.delegate_id
+        WHERE d.org_id = ? AND d.status = 'active'
+        """,
+        (org_id,),
+    ).fetchall()
+    for r in rows:
+        reasons: list[str] = []
+        if r["g_role"] != "admin" or r["g_status"] != "active":
+            reasons.append("grantor_not_admin")
+        if r["d_role"] != "member" or r["d_status"] != "active":
+            reasons.append("delegate_ineligible")
+        if not reasons:
+            continue
+        reason = ",".join(reasons)
+        c.execute(
+            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
+            " WHERE id = ?",
+            (reason, ts, r["id"]),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=None, action="delegation.invalidated",
+            target_type="delegation", target_id=r["id"],
+            before={"status": "active"},
+            after={"status": "invalidated", "reason": reason}, ts=ts,
+        )
+
+
+def _invalidate_delegations_for_member_change(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    target_user_id: int,
+    new_role: str,
+    new_status: str,
+    actor_id: int,
+    ts: int,
+) -> None:
+    """Invalidate active delegations affected by a member role/status change.
+
+    Runs in the SAME transaction as the member change, so the change and the
+    invalidation audit rows commit atomically. Invalidation is permanent:
+    later restoring the role/status does not revive anything.
+    """
+    rows = c.execute(
+        """
+        SELECT d.id, d.grantor_id, d.delegate_id
+        FROM delegations d
+        WHERE d.org_id = ? AND d.status = 'active'
+          AND (d.grantor_id = ? OR d.delegate_id = ?)
+        """,
+        (org_id, target_user_id, target_user_id),
+    ).fetchall()
+    for r in rows:
+        reasons: list[str] = []
+        if r["grantor_id"] == target_user_id and (new_role != "admin" or new_status != "active"):
+            reasons.append("grantor_not_admin")
+        if r["delegate_id"] == target_user_id and (new_role != "member" or new_status != "active"):
+            reasons.append("delegate_ineligible")
+        if not reasons:
+            continue
+        reason = ",".join(reasons)
+        c.execute(
+            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
+            " WHERE id = ?",
+            (reason, ts, r["id"]),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
+            target_type="delegation", target_id=r["id"],
+            before={"status": "active"},
+            after={"status": "invalidated", "reason": reason,
+                   "triggered_by": target_user_id}, ts=ts,
+        )
+
+
+@app.post("/orgs/{org_id}/delegations", status_code=201)
+def create_delegation(
+    org_id: int,
+    body: CreateDelegationRequest,
+    request_body: bytes = Depends(raw_body),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+) -> dict[str, Any]:
+    def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        # Expired delegations no longer block a fresh grant.
+        _sweep_delegations(c, org_id, ts)
+        m = c.execute(
+            "SELECT * FROM memberships WHERE org_id = ? AND user_id = ?",
+            (org_id, body.user_id),
+        ).fetchone()
+        if m is None or m["role"] != "member" or m["status"] != "active":
+            # Missing user, non-member, disabled or administrator: one code.
+            raise conflict("ineligible_member", "target is not an active ordinary member")
+        existing = c.execute(
+            "SELECT id FROM delegations"
+            " WHERE org_id = ? AND delegate_id = ? AND status = 'active'",
+            (org_id, body.user_id),
+        ).fetchone()
+        if existing is not None:
+            raise conflict("delegation_exists", "member already has an active delegation")
+        try:
+            cur = c.execute(
+                """
+                INSERT INTO delegations
+                    (org_id, grantor_id, delegate_id, status,
+                     created_at, starts_at, expires_at)
+                VALUES (?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (org_id, user.id, body.user_id, ts, ts, ts + body.duration_seconds),
+            )
+        except sqlite3.IntegrityError:
+            # Concurrent grant for the same member: unique partial index.
+            raise conflict("delegation_exists", "member already has an active delegation")
+        d_id = cur.lastrowid
+        add_audit(
+            c, org_id=org_id, actor_id=user.id, action="delegation.created",
+            target_type="delegation", target_id=d_id, before=None,
+            after={"id": d_id, "grantor_id": user.id, "delegate_id": body.user_id,
+                   "starts_at": ts, "expires_at": ts + body.duration_seconds},
+            ts=ts,
+        )
+        row = c.execute("SELECT * FROM delegations WHERE id = ?", (d_id,)).fetchone()
+        return 201, delegation_dict(row)
+
+    _, resp = _run_idempotent(
+        conn, user, idempotency.scope_delegation_create(org_id), idempotency_key, request_body,
+        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        perform=_perform,
+    )
+    return resp
+
+
+@app.get("/orgs/{org_id}/delegations")
+def list_delegations(
+    org_id: int,
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    with transaction(conn):
+        m = require_membership(conn, user, org_id)
+        _sweep_delegations(conn, org_id, now_ts())
+        if m["role"] == "admin":
+            # Administrators see every delegation in the organization.
+            rows = conn.execute(
+                """
+                SELECT d.*, gu.username AS grantor_username, du.username AS delegate_username
+                FROM delegations d
+                JOIN users gu ON gu.id = d.grantor_id
+                JOIN users du ON du.id = d.delegate_id
+                WHERE d.org_id = ?
+                ORDER BY d.id DESC
+                """,
+                (org_id,),
+            ).fetchall()
+        else:
+            # Delegates only ever see their own.
+            rows = conn.execute(
+                """
+                SELECT d.*, gu.username AS grantor_username, du.username AS delegate_username
+                FROM delegations d
+                JOIN users gu ON gu.id = d.grantor_id
+                JOIN users du ON du.id = d.delegate_id
+                WHERE d.org_id = ? AND d.delegate_id = ?
+                ORDER BY d.id DESC
+                """,
+                (org_id, user.id),
+            ).fetchall()
+    return {
+        "delegations": [
+            delegation_dict(
+                r, grantor_username=r["grantor_username"],
+                delegate_username=r["delegate_username"],
+            )
+            for r in rows
+        ]
+    }
+
+
+@app.post("/orgs/{org_id}/delegations/{delegation_id}/revoke")
+def revoke_delegation(
+    org_id: int,
+    delegation_id: int,
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    with transaction(conn):
+        require_membership(conn, user, org_id, admin=True)
+        ts = now_ts()
+        d = conn.execute(
+            "SELECT * FROM delegations WHERE id = ? AND org_id = ?",
+            (delegation_id, org_id),
+        ).fetchone()
+        if d is None:
+            # Missing or belongs to another org: uniform 404.
+            raise not_found("not_found", "delegation not found")
+        if d["status"] != "active":
+            # Idempotent no-op: repeated revocation succeeds but writes no
+            # state change and no second audit row.
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return delegation_dict(row)
+        conn.execute(
+            "UPDATE delegations SET status = 'revoked', revoked_at = ?, revoked_by = ?"
+            " WHERE id = ?",
+            (ts, user.id, delegation_id),
+        )
+        add_audit(
+            conn, org_id=org_id, actor_id=user.id, action="delegation.revoked",
+            target_type="delegation", target_id=delegation_id,
+            before={"status": "active"},
+            after={"status": "revoked", "revoked_by": user.id}, ts=ts,
+        )
+        row = conn.execute(
+            "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+        ).fetchone()
+    return delegation_dict(row)
+
+
 # ================================================================ invitations
 
 @app.post("/orgs/{org_id}/invites", status_code=201)
@@ -374,18 +676,54 @@ def create_invite(
     conn: sqlite3.Connection = Depends(get_conn),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
 ) -> dict[str, Any]:
+    # Delegation backing the current operation, captured by check_perm and
+    # consumed by perform inside the SAME transaction (no race possible).
+    backing: dict[str, Any] = {}
+
+    def _check_perm(c: sqlite3.Connection) -> None:
+        m = require_membership(c, user, org_id)
+        if m["role"] == "admin":
+            # Administrators need no delegation.
+            backing["delegation"] = None
+        else:
+            # Ordinary members may only issue invites while their delegation
+            # is active; from the expiry moment on this raises 403.
+            backing["delegation"] = _active_delegation(c, org_id, user.id, now_ts())
+
+    def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
+        # An idempotent retry must still be authorized by the ORIGINAL
+        # delegation that backed the stored response: if that delegation is
+        # no longer active the retry is 403, even if a fresh delegation now
+        # exists. Admin-issued replays require admin membership again.
+        resp = idempotency.replay_body(row)
+        d_id = resp.get("delegation_id")
+        if d_id is None:
+            require_membership(c, user, org_id, admin=True)
+            return
+        d = c.execute(
+            "SELECT * FROM delegations WHERE id = ? AND org_id = ?", (d_id, org_id)
+        ).fetchone()
+        if d is None or d["status"] != "active" or d["expires_at"] <= now_ts():
+            raise forbidden()
+
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        d = backing.get("delegation")
+        delegation_id = d["id"] if d is not None else None
+        if d is not None and body.role != "member":
+            # Delegates may only issue member invites.
+            raise forbidden()
         raw_token = generate_invite_token()
         expires_at = ts + config.INVITE_TTL_SECONDS
         cur = c.execute(
             """
             INSERT INTO invites
                 (org_id, token_hash, invite_username, role, status,
-                 created_by, created_at, expires_at, used_at, used_by, revoked_at)
-            VALUES (?, ?, ?, ?, 'available', ?, ?, ?, NULL, NULL, NULL)
+                 created_by, created_at, expires_at, used_at, used_by, revoked_at,
+                 delegation_id)
+            VALUES (?, ?, ?, ?, 'available', ?, ?, ?, NULL, NULL, NULL, ?)
             """,
             (org_id, hash_token(raw_token), body.username, body.role,
-             user.id, ts, expires_at),
+             user.id, ts, expires_at, delegation_id),
         )
         invite_id = cur.lastrowid
         add_audit(
@@ -393,7 +731,8 @@ def create_invite(
             target_type="invite", target_id=invite_id,
             before=None,
             after={"id": invite_id, "username": body.username, "role": body.role,
-                   "status": "available", "expires_at": expires_at},
+                   "status": "available", "expires_at": expires_at,
+                   "delegation_id": delegation_id},
             ts=ts,
         )
         return 201, {
@@ -405,12 +744,12 @@ def create_invite(
             "token": raw_token,  # returned only here / on idempotent replay
             "created_at": ts,
             "expires_at": expires_at,
+            "delegation_id": delegation_id,
         }
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_invite_create(org_id), idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
-        perform=_perform,
+        check_perm=_check_perm, replay_check=_replay_check, perform=_perform,
     )
     return resp
 
@@ -423,16 +762,32 @@ def revoke_invite(
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict[str, Any]:
     with transaction(conn):
-        require_membership(conn, user, org_id, admin=True)
+        m = require_membership(conn, user, org_id)
         ts = now_ts()
+        _sweep_delegations(conn, org_id, ts)
         inv = conn.execute(
             "SELECT * FROM invites WHERE org_id = ? AND token_hash = ?",
             (org_id, hash_token(body.token)),
         ).fetchone()
-        if inv is None or inv["status"] != "available" or inv["expires_at"] <= ts:
-            # Missing, already used/revoked or expired: same stable code.
-            raise conflict("invite_unavailable", "invite is not available")
-        before = {"id": inv["id"], "status": inv["status"]}
+        if m["role"] == "admin":
+            # Administrators revoke any invite in the organization.
+            if inv is None or inv["status"] != "available" or inv["expires_at"] <= ts:
+                # Missing, already used/revoked or expired: same stable code.
+                raise conflict("invite_unavailable", "invite is not available")
+            delegation_id = inv["delegation_id"]
+        else:
+            # Delegates may only revoke invites they issued by virtue of
+            # their CURRENT delegation: other delegations' invites and
+            # admin invites are out of scope (403); unavailable invites
+            # follow the existing invite rules (409).
+            d = _active_delegation(conn, org_id, user.id, ts)
+            if inv is None or inv["delegation_id"] != d["id"]:
+                raise forbidden()
+            if inv["status"] != "available" or inv["expires_at"] <= ts:
+                raise conflict("invite_unavailable", "invite is not available")
+            delegation_id = d["id"]
+        before = {"id": inv["id"], "status": inv["status"],
+                  "delegation_id": inv["delegation_id"]}
         conn.execute(
             "UPDATE invites SET status = 'revoked', revoked_at = ? WHERE id = ?",
             (ts, inv["id"]),
@@ -440,7 +795,9 @@ def revoke_invite(
         add_audit(
             conn, org_id=org_id, actor_id=user.id, action="invite.revoked",
             target_type="invite", target_id=inv["id"],
-            before=before, after={"id": inv["id"], "status": "revoked"}, ts=ts,
+            before=before,
+            after={"id": inv["id"], "status": "revoked", "delegation_id": delegation_id},
+            ts=ts,
         )
     return {"id": inv["id"], "status": "revoked"}
 
@@ -559,7 +916,8 @@ def update_member(
                 )
 
         before = {"role": m["role"], "status": m["status"]}
-        if new_role != m["role"] or new_status != m["status"]:
+        changed = new_role != m["role"] or new_status != m["status"]
+        if changed:
             c.execute(
                 "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
                 " WHERE id = ?",
@@ -569,6 +927,13 @@ def update_member(
                 c, org_id=org_id, actor_id=user.id, action="member.updated",
                 target_type="membership", target_id=m["id"],
                 before=before, after={"role": new_role, "status": new_status}, ts=ts,
+            )
+            # Member change invalidates affected delegations in the SAME
+            # transaction; the change and the invalidation audit commit or
+            # roll back together.
+            _invalidate_delegations_for_member_change(
+                c, org_id=org_id, target_user_id=target_user_id,
+                new_role=new_role, new_status=new_status, actor_id=user.id, ts=ts,
             )
 
         row = c.execute(

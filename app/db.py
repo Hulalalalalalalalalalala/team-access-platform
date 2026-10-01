@@ -52,6 +52,26 @@ CREATE TABLE IF NOT EXISTS memberships (
 );
 CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id, status);
 
+CREATE TABLE IF NOT EXISTS delegations (
+    id              INTEGER PRIMARY KEY,
+    org_id          INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    grantor_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    delegate_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL CHECK (status IN ('active','expired','revoked','invalidated')),
+    invalid_reason  TEXT,                      -- grantor_not_admin | delegate_ineligible | ...
+    created_at      INTEGER NOT NULL,
+    starts_at       INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    revoked_at      INTEGER,
+    revoked_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    invalidated_at  INTEGER
+);
+-- At most one ACTIVE delegation per (org, delegate); expired/revoked/invalidated
+-- rows do not block a fresh grant.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_one_active
+    ON delegations(org_id, delegate_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_delegations_org ON delegations(org_id, status);
+
 CREATE TABLE IF NOT EXISTS invites (
     id              INTEGER PRIMARY KEY,
     org_id          INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -64,7 +84,8 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at      INTEGER NOT NULL,
     used_at         INTEGER,
     used_by         INTEGER REFERENCES users(id),
-    revoked_at      INTEGER
+    revoked_at      INTEGER,
+    delegation_id   INTEGER REFERENCES delegations(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_invites_user ON invites(invite_username);
 
@@ -148,6 +169,14 @@ def init_db() -> None:
         try:
             conn.executescript(SCHEMA)
             conn.execute(FAIL_TRIGGER)
+            # Migration for databases created before delegations existed:
+            # add invites.delegation_id if it is missing.
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(invites)")]
+            if "delegation_id" not in cols:
+                conn.execute(
+                    "ALTER TABLE invites ADD COLUMN delegation_id "
+                    "INTEGER REFERENCES delegations(id) ON DELETE SET NULL"
+                )
         finally:
             conn.close()
         _initialized = True

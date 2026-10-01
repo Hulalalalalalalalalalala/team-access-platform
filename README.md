@@ -26,10 +26,19 @@
 - **审计**：组织、邀请、成员的每一次变更与审计行在**同一事务原子提交**，失败无部分写入；
   审计包含组织、操作者、动作、对象、时间戳及前后状态；仅本组织管理员可分页查询，
   不提供任何修改或删除接口。
-- **幂等**：创建组织、签发邀请、调整成员角色 / 状态支持 `Idempotency-Key` 请求头。
+- **临时委托邀请管理**：启用管理员可指定本组织一名**启用的普通成员**为受托人，
+  将邀请管理交托对方一段有限时间（`60..86400` 秒的整数）。受托人在有效期内沿用
+  现有邀请入口签发 **member** 邀请，并可撤销自己凭这份委托签发的邀请；不能签发
+  admin 邀请、撤销他人或其他委托签发的邀请、调整成员、读取审计或继续委托。
+  委托**不计入**最后一个管理员约束，受托人角色仍为 `member`；委托失效不撤销此前
+  签发的邀请。授予人不再是启用管理员，或受托人不再是启用普通成员时，委托**永久失效**
+  （恢复角色/状态也不能复活，只能重新授予）。管理员可查询/撤销本组织全部委托，
+  受托人只能查询自己的委托。
+- **幂等**：创建组织、签发邀请、调整成员角色 / 状态、创建委托支持 `Idempotency-Key` 请求头。
   同一操作者、同一操作作用域（组织内操作还区分目标组织）、相同键 + 相同请求体
   返回首次成功结果；同键不同请求体 → `409 idempotency_conflict`；
-  重试会重新校验当前权限；并发重试只产生一次业务变更和一条审计；记录持久化，重启后仍有效。
+  重试会重新校验当前权限（委托签发邀请的幂等重试仍由原委托授权，原委托失效后
+  返回 `403`，即使已有新委托）；并发重试只产生一次业务变更和一条审计；记录持久化，重启后仍有效。
 
 ## 快速启动
 
@@ -112,6 +121,26 @@ curl -s -X PATCH $B/orgs/1/members/2 -H "Authorization: Bearer $TOK_A" \
 
 # 8. 退出（当前会话立即失效）
 curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
+
+# 9. 临时委托邀请管理（受托人仍是普通成员，不计入最后管理员约束）
+# 9a. 管理员授予：bob 可在 3600 秒内签发 member 邀请
+BOB_ID=$(curl -s $B/orgs/1/members -H "Authorization: Bearer $TOK_A" \
+  | python3 -c 'import sys,json;print(next(m["user_id"] for m in json.load(sys.stdin)["members"] if m["username"]=="bob"))')
+DEL=$(curl -s -X POST $B/orgs/1/delegations -H "Authorization: Bearer $TOK_A" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: deleg-1' \
+  -d "{\"user_id\":$BOB_ID,\"duration_seconds\":3600}")
+DEL_ID=$(echo "$DEL" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# 9b. 受托人沿用现有入口签发 member 邀请（role 必须是 member）
+TOK_B=$(curl -s -X POST $B/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"bob","password":"Builder123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST $B/orgs/1/invites -H "Authorization: Bearer $TOK_B" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"carol","role":"member"}'
+# 9c. 受托人只能撤销自己凭这份委托签发的邀请；admin 邀请 / 他人邀请 → 403
+# 9d. 管理员查询全部委托（受托人只看自己的）
+curl -s $B/orgs/1/delegations -H "Authorization: Bearer $TOK_A"
+# 9e. 管理员撤销委托（重复撤销成功，不重复记录审计）
+curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $TOK_A"
 ```
 
 ## API 一览
@@ -125,10 +154,13 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 | GET | `/orgs` | 登录用户 | — |
 | GET | `/orgs/{org_id}/members` | 本组织启用成员 | — |
 | GET | `/orgs/{org_id}/members/me` | 本组织启用成员 | — |
-| POST | `/orgs/{org_id}/invites` | 本组织管理员 | ✔（按组织隔离） |
-| POST | `/orgs/{org_id}/invites/revoke` | 本组织管理员 | — |
+| POST | `/orgs/{org_id}/invites` | 本组织管理员 **或** 有效受托人 | ✔（按组织隔离） |
+| POST | `/orgs/{org_id}/invites/revoke` | 本组织管理员 **或** 签发该邀请的受托人 | — |
 | POST | `/invites/accept` | 登录用户 | — |
 | PATCH | `/orgs/{org_id}/members/{user_id}` | 本组织管理员 | ✔（按组织隔离） |
+| POST | `/orgs/{org_id}/delegations` | 本组织管理员 | ✔（按组织隔离） |
+| GET | `/orgs/{org_id}/delegations` | 本组织启用成员（管理员看全部，受托人只看自己） | — |
+| POST | `/orgs/{org_id}/delegations/{delegation_id}/revoke` | 本组织管理员 | — |
 | GET | `/orgs/{org_id}/audit?page=&page_size=` | 本组织管理员 | — |
 
 ## 错误响应
@@ -150,6 +182,8 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 | 409 | `invite_unavailable` | 邀请不存在 / 过期 / 已撤销 / 已使用 / 并发竞争失败 |
 | 409 | `already_member` | 已有成员再接受邀请（不覆盖角色 / 状态） |
 | 409 | `last_admin_required` | 停用 / 降级最后一个启用管理员（含自我操作、并发竞争） |
+| 409 | `ineligible_member` | 委托目标不存在 / 已停用 / 不是普通成员 |
+| 409 | `delegation_exists` | 同一组织同一成员已有一份有效委托（含并发授予） |
 | 409 | `idempotency_conflict` | 同幂等键但请求体不同 |
 | 404 | `not_found` / `member_not_found` | 路由不存在 / 目标成员不存在 |
 | 422 | `validation_error` | 请求体不合法 |
@@ -173,7 +207,7 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 
 ```bash
 ./.venv/bin/python -m pytest -q
-# 42 passed
+# 70 passed
 ```
 
 覆盖范围：注册 / 登录 / 退出与多会话隔离、重复用户名、统一 401/403、角色权限隔离、
@@ -181,3 +215,12 @@ curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 已是成员不覆盖、最后管理员（含并发降级）、审计内容 / 分页 / 组织隔离 / 只读、
 幂等重放 / 冲突 / 权限重校 / 并发一次变更 / 失败不缓存、事务回滚无部分写入、
 明文秘密不落盘不入日志、重启后数据 / 会话 / 审计 / 幂等记录全部保留。
+
+委托专项：创建校验（60..86400 整数）、目标资格（不存在 / 停用 / 非普通成员 →
+`ineligible_member`）、重复有效委托（`delegation_exists`，含并发）、受托人签发
+member 邀请与撤销本人邀请、越权（admin 邀请 / 他人邀请 / 调成员 / 读审计 / 再委托）
+统一 403、列表可见性（管理员看全部 / 受托人只看自己）、四种状态（有效 / 到期 /
+撤销 / 成员变化失效）及原因、重复撤销成功不重复审计、到期边界即时失权、授予人或
+受托人资格永久失效（恢复不复活）、委托签发邀请的幂等重试仍由原委托授权、并发授予
+唯一有效、并发撤销与邀请的串行化语义、重启后委托 / 失效状态 / 幂等结果保留、
+审计原子回滚。
