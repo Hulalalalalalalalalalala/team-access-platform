@@ -6,6 +6,7 @@ Auth
   POST /auth/register   register with unique username + password
   POST /auth/login      start a session (returns opaque token once)
   POST /auth/logout     invalidate the current session immediately
+  POST /auth/password   change own password (revokes all sessions)
 
 Organizations
   POST /orgs                 create an org (creator becomes admin) [idempotent]
@@ -37,7 +38,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 
 from . import config, idempotency
 from .audit import add_audit
-from .auth import CurrentUser, current_user, require_membership
+from .auth import CurrentUser, _extract_token, current_user, require_membership
 from .db import get_conn, init_db, transaction
 from .errors import (
     ApiError,
@@ -45,10 +46,12 @@ from .errors import (
     forbidden,
     install_exception_handlers,
     not_found,
+    unauthorized,
 )
 from .schemas import (
     AcceptInviteRequest,
     BatchUpdateMembersRequest,
+    ChangePasswordRequest,
     CreateDelegationRequest,
     CreateInviteRequest,
     CreateOrgRequest,
@@ -186,6 +189,68 @@ def logout(
             (now_ts(), user.session_id),
         )
     return {"logged_out": True}
+
+
+@app.post("/auth/password")
+def change_password(
+    body: ChangePasswordRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+) -> dict[str, bool]:
+    """Change the password of the account that owns the session.
+
+    Works for any authenticated account — organization membership or member
+    status is irrelevant. Body validation (422) happens before the session
+    check, so malformed bodies never reveal session state. On success the
+    password hash and the revocation of EVERY existing session of the
+    account (including the one making this request) commit in ONE transaction:
+    they take effect together or not at all. No replacement token is issued;
+    the user must log in again with the new password.
+    """
+    # Hashing is a pure function of the new password; doing it before the
+    # write transaction keeps the write-lock hold time short.
+    new_hash = hash_password(body.new_password)
+    token = _extract_token(authorization, x_session_token)
+    if not token:
+        raise unauthorized()
+    ts = now_ts()
+    with transaction(conn):
+        # The session is (re-)validated INSIDE the write transaction.
+        # BEGIN IMMEDIATE serializes concurrent changers, so a second
+        # in-flight request for the same account observes the revocation
+        # committed by the winner and fails closed with 401 — exactly one
+        # concurrent change can succeed. A session that was logged out or
+        # expired after the request started is likewise rejected here.
+        row = conn.execute(
+            """
+            SELECT s.id AS session_id, s.expires_at, s.revoked_at,
+                   u.id AS user_id, u.password_hash AS password_hash
+            FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (hash_token(token),),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None or row["expires_at"] <= ts:
+            raise unauthorized("invalid or expired session")
+        if not verify_password(body.current_password, row["password_hash"]):
+            # Wrong current password: nothing changes (session included).
+            raise ApiError(403, "invalid_current_password", "current password is incorrect")
+        if body.current_password == body.new_password:
+            raise conflict(
+                "password_unchanged", "new password must differ from the current password"
+            )
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (new_hash, row["user_id"]),
+        )
+        # Revoke every still-live session of THIS account on every device,
+        # the requesting one included. Other accounts are untouched.
+        conn.execute(
+            "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (ts, row["user_id"]),
+        )
+    return {"password_changed": True}
 
 
 # ============================================================== organizations
