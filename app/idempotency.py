@@ -8,6 +8,8 @@ safely be reused across different operations:
 * ``org:<id>:member.update``     -- changing one member's role/status in an org
 * ``org:<id>:member.batch_update`` -- batch member changes (own scope, never
   shares keys with the single-member entry point)
+* ``org:<id>:member.remove``     -- removing a member from an org (own scope,
+  never shares keys with the single/batch adjustment entry points)
 
 A stored record captures the fingerprint of the request body and the first
 *successful* response. Replays with the same key+body return the stored
@@ -44,6 +46,12 @@ def scope_member_batch_update(org_id: int) -> str:
     # Distinct from the single-member scope so the two entry points never
     # consume each other's keys.
     return f"org:{org_id}:member.batch_update"
+
+
+def scope_member_remove(org_id: int) -> str:
+    # Distinct from the adjustment scopes so removal never consumes a key
+    # used by the single-member or batch adjustment entry points.
+    return f"org:{org_id}:member.remove"
 
 
 def scope_delegation_create(org_id: int) -> str:

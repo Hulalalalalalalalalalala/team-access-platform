@@ -14,6 +14,7 @@ Organizations
   GET  /orgs/{org_id}/members/me              own membership state
   PATCH /orgs/{org_id}/members/batch          batch role/status change [idempotent]
   PATCH /orgs/{org_id}/members/{user_id}      role/status change   [idempotent]
+  DELETE /orgs/{org_id}/members/{user_id}     remove a member      [idempotent]
 
 Invitations
   POST /orgs/{org_id}/invites         admin issues single-use invite [idempotent]
@@ -1128,6 +1129,171 @@ def update_member(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
         check_perm=lambda c: require_membership(c, user, org_id, admin=True),
         perform=_perform,
+    )
+    return resp
+
+
+@app.delete("/orgs/{org_id}/members/{target_user_id}")
+def remove_member(
+    org_id: int,
+    target_user_id: int,
+    request_body: bytes = Depends(raw_body),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+) -> dict[str, Any]:
+    """Permanently remove a member from the organization.
+
+    Unlike disable/enable (which keep the membership row), removal deletes it:
+    the target vanishes from the roster and from their own organization list,
+    and every session loses access to THIS organization on the next request.
+    The account, its sessions and its memberships in other organizations are
+    untouched. Active admins may remove anyone — active, disabled, or
+    themselves — except the organization's last active administrator.
+    """
+
+    def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        m = c.execute(
+            "SELECT * FROM memberships WHERE org_id = ? AND user_id = ?",
+            (org_id, target_user_id),
+        ).fetchone()
+        if m is None:
+            # Target is not in THIS organization. Authorization has already
+            # passed, so this reveals nothing about organization existence.
+            raise not_found("member_not_found", "member not found")
+
+        # Last-active-administrator invariant (self-removal included).
+        # A DISABLED admin does not count toward the quota, so removing one
+        # never trips this check; BEGIN IMMEDIATE serializes concurrent
+        # removals/adjustments so zero active admins is impossible.
+        if m["role"] == "admin" and m["status"] == "active":
+            other_active_admins = c.execute(
+                "SELECT COUNT(*) AS n FROM memberships"
+                " WHERE org_id = ? AND role = 'admin' AND status = 'active'"
+                " AND user_id != ?",
+                (org_id, target_user_id),
+            ).fetchone()["n"]
+            if other_active_admins == 0:
+                raise conflict(
+                    "last_admin_required",
+                    "organization must retain at least one active administrator",
+                )
+
+        urow = c.execute(
+            "SELECT username FROM users WHERE id = ?", (target_user_id,)
+        ).fetchone()
+        target_username = urow["username"] if urow is not None else None
+        before = {
+            "user_id": target_user_id,
+            "username": target_username,
+            "role": m["role"],
+            "status": m["status"],
+            "created_at": m["created_at"],
+            "updated_at": m["updated_at"],
+        }
+
+        # Revoke every still-usable invite bound to the target's USERNAME that
+        # exists at this instant. Used/revoked/expired invites keep their
+        # state and rules; invites issued AFTER this removal commits are new
+        # rows and stay usable (rejoining via a fresh invite is allowed).
+        revoked_rows = c.execute(
+            """
+            SELECT id FROM invites
+            WHERE org_id = ? AND invite_username = ?
+              AND status = 'available' AND expires_at > ?
+            """,
+            (org_id, target_username, ts),
+        ).fetchall()
+        revoked_ids = [r["id"] for r in revoked_rows]
+        if revoked_ids:
+            placeholders = ",".join("?" for _ in revoked_ids)
+            c.execute(
+                f"UPDATE invites SET status = 'revoked', revoked_at = ?"
+                f" WHERE id IN ({placeholders})",
+                (ts, *revoked_ids),
+            )
+            for iid in revoked_ids:
+                add_audit(
+                    c, org_id=org_id, actor_id=user.id, action="invite.revoked",
+                    target_type="invite", target_id=iid,
+                    before={"status": "available"},
+                    after={"status": "revoked", "reason": "member_removed",
+                           "removed_user_id": target_user_id},
+                    ts=ts,
+                )
+
+        # Permanently invalidate every active delegation in which the target
+        # participates as grantor or delegate, reusing the existing
+        # invalidation reasons. Rejoining later never revives them. Sweep
+        # first so a merely time-expired delegation keeps its ``expired``
+        # state instead of being mislabelled; only still-EFFECTIVE
+        # delegations are invalidated here. A delegation never has the same
+        # user as both grantor and delegate, so at most one reason applies
+        # per row.
+        _sweep_delegations(c, org_id, ts)
+        deleg_rows = c.execute(
+            """
+            SELECT id, grantor_id, delegate_id FROM delegations
+            WHERE org_id = ? AND status = 'active'
+              AND (grantor_id = ? OR delegate_id = ?)
+            """,
+            (org_id, target_user_id, target_user_id),
+        ).fetchall()
+        invalidated: list[dict[str, Any]] = []
+        for r in deleg_rows:
+            reason = (
+                "grantor_not_admin"
+                if r["grantor_id"] == target_user_id
+                else "delegate_ineligible"
+            )
+            c.execute(
+                "UPDATE delegations SET status = 'invalidated', invalid_reason = ?,"
+                " invalidated_at = ? WHERE id = ?",
+                (reason, ts, r["id"]),
+            )
+            add_audit(
+                c, org_id=org_id, actor_id=user.id, action="delegation.invalidated",
+                target_type="delegation", target_id=r["id"],
+                before={"status": "active"},
+                after={"status": "invalidated", "reason": reason,
+                       "triggered_by": target_user_id, "trigger": "member_removed"},
+                ts=ts,
+            )
+            invalidated.append({"id": r["id"], "reason": reason})
+
+        # The membership itself disappears (disable/enable keep the row;
+        # removal does not). ON DELETE rules do not apply here: the user,
+        # sessions, invites and historical audit rows all survive.
+        c.execute("DELETE FROM memberships WHERE id = ?", (m["id"],))
+
+        add_audit(
+            c, org_id=org_id, actor_id=user.id, action="member.removed",
+            target_type="membership", target_id=f"{org_id}:{target_user_id}",
+            before=before,
+            after={"org_id": org_id, "user_id": target_user_id,
+                   "username": target_username,
+                   "revoked_invite_ids": revoked_ids,
+                   "invalidated_delegations": invalidated},
+            ts=ts,
+        )
+        return 200, {"org_id": org_id, "user_id": target_user_id, "removed": True}
+
+    def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
+        # A DELETE carries no body, so the request fingerprint cannot
+        # distinguish targets: a stored key replayed against a DIFFERENT
+        # target (or org) is an idempotency conflict, never a second removal.
+        resp = idempotency.replay_body(row)
+        if resp.get("org_id") != org_id or resp.get("user_id") != target_user_id:
+            raise conflict(
+                "idempotency_conflict",
+                "Idempotency-Key was already used for a different target",
+            )
+
+    _, resp = _run_idempotent(
+        conn, user, idempotency.scope_member_remove(org_id),
+        idempotency_key, request_body,
+        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        perform=_perform, replay_check=_replay_check,
     )
     return resp
 
