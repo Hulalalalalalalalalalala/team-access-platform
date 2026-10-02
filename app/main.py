@@ -161,20 +161,43 @@ def register(body: RegisterRequest, conn: sqlite3.Connection = Depends(get_conn)
 @app.post("/auth/login")
 def login(body: LoginRequest, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
     ts = now_ts()
+    # Fast-path verification BEFORE taking the write lock: unknown users and
+    # the vast majority of wrong passwords are rejected without ever holding
+    # the lock, keeping the write-lock hold time short in the common case.
     user_row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
     ).fetchone()
-    # Same error whether the username is unknown or the password is wrong.
-    if user_row is None or not verify_password(body.password, user_row["password_hash"]):
-        raise ApiError(401, "invalid_credentials", "invalid username or password")
+    outside_ok = user_row is not None and verify_password(body.password, user_row["password_hash"])
     raw_token = generate_session_token()
     with transaction(conn):
+        # Authoritative re-check under BEGIN IMMEDIATE. A password change
+        # that committed after the check above (or that commits before our
+        # lock acquisition) must invalidate this login: a request that
+        # passed the old-password check early must not still obtain a live
+        # session once the change has taken effect. When the stored hash is
+        # unchanged the outside result still holds; otherwise re-verify
+        # against the hash that is actually committed now.
+        current = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (body.username,)
+        ).fetchone()
+        if current is not None and current["password_hash"] == (
+            user_row["password_hash"] if user_row is not None else None
+        ):
+            ok = outside_ok
+        else:
+            ok = current is not None and verify_password(
+                body.password, current["password_hash"]
+            )
+        if not ok:
+            # Uniform 401 whether the username is unknown or the password
+            # is wrong; no session row is inserted, so nothing to revoke.
+            raise ApiError(401, "invalid_credentials", "invalid username or password")
         conn.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, revoked_at)"
             " VALUES (?, ?, ?, ?, NULL)",
-            (hash_token(raw_token), user_row["id"], ts, ts + config.SESSION_TTL_SECONDS),
+            (hash_token(raw_token), current["id"], ts, ts + config.SESSION_TTL_SECONDS),
         )
-    return {"token": raw_token, "user": user_public(user_row)}
+    return {"token": raw_token, "user": user_public(current)}
 
 
 @app.post("/auth/logout")

@@ -1,6 +1,8 @@
 """POST /auth/password — change own password, revoke all sessions."""
 from __future__ import annotations
 
+import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from tests.conftest import Api
@@ -236,3 +238,121 @@ def test_password_and_hash_not_leaked(api: Api, server, db):
     ).fetchone()["password_hash"]
     assert stored.startswith("pbkdf2_sha256$")
     assert new_pw not in stored and old_pw not in stored
+
+
+# ------------------------------------------------- login vs change-password race
+
+def test_old_password_login_after_change_committed_is_rejected(api: Api, db):
+    """An old-password login that passed verification BEFORE the change
+    committed must not obtain a session once the change has taken effect —
+    even though the request arrived early and passed the old-password check.
+
+    Deterministic interleaving: the login does its old-password verification
+    against the committed (old) hash, then blocks on BEGIN IMMEDIATE while the
+    test side holds the write lock. While blocked, the change commits (new
+    hash + revoke every live session). When the login finally proceeds, it
+    must re-check against the committed hash and fail closed.
+    """
+    from app.security import hash_password, now_ts
+
+    u = api.unique()
+    api.register(u, "OldPass 1")
+    pre = api.token_for(u, "OldPass 1")
+
+    # Hold the write lock from the test side. The login still does its
+    # old-password verification (no lock needed for the read), then blocks on
+    # BEGIN IMMEDIATE.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(api.login, u, "OldPass 1")
+            time.sleep(0.6)  # let the login pass verification and block on the lock
+
+            # While the login is blocked, the change commits: new hash +
+            # revoke every live session of the account.
+            new_hash = hash_password("NewPass 2")
+            db.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (new_hash, u),
+            )
+            db.execute(
+                "UPDATE sessions SET revoked_at = ?"
+                " WHERE user_id = (SELECT id FROM users WHERE username = ?)"
+                "   AND revoked_at IS NULL",
+                (now_ts(), u),
+            )
+            db.commit()
+
+        r = fut.result(timeout=10)
+    finally:
+        try:
+            db.rollback()
+        except sqlite3.Error:
+            pass
+
+    # The login must be rejected: no token, no usable session.
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "invalid_credentials"
+    assert "token" not in r.json()
+    # The pre-existing session was revoked by the change.
+    assert api.request("GET", "/orgs", token=pre).status_code == 401
+    # New password works and its session is not revoked.
+    r = api.login(u, "NewPass 2")
+    assert r.status_code == 200
+    assert api.request("GET", "/orgs", token=r.json()["token"]).status_code == 200
+
+
+def test_many_old_password_logins_racing_with_change_leave_no_valid_session(api: Api, db):
+    """Firing many old-password logins concurrently with one password change
+    must leave no valid old-password session behind, regardless of how the
+    requests interleave. Every old-password login either fails with 401 or
+    returns a token that is already revoked; the new password still works.
+    """
+    u = api.unique()
+    api.register(u, "OldPass 1")
+    pre = api.token_for(u, "OldPass 1")
+    assert api.request("GET", "/orgs", token=pre).status_code == 200
+
+    # Hold the write lock so all logins and the change queue up, then release
+    # them together — this reliably exercises the race window.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        results: list = []
+
+        def old_login() -> None:
+            results.append(api.login(u, "OldPass 1"))
+
+        def change():
+            return _change(api, pre, "OldPass 1", "NewPass 2")
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            login_futs = [pool.submit(old_login) for _ in range(15)]
+            change_fut = pool.submit(change)
+            time.sleep(0.6)  # let everything queue up behind the lock
+            db.commit()  # release the lock: all queued requests race
+            for f in login_futs:
+                f.result(timeout=15)
+            change_fut.result(timeout=15)
+    finally:
+        try:
+            db.rollback()
+        except sqlite3.Error:
+            pass
+
+    # Every old-password login either failed or returned a revoked token.
+    for r in results:
+        if r.status_code == 200:
+            tok = r.json()["token"]
+            assert api.request("GET", "/orgs", token=tok).status_code == 401
+            assert "token" in r.json()  # the original success shape is preserved
+        else:
+            assert r.status_code == 401
+            assert r.json()["error"]["code"] == "invalid_credentials"
+
+    # The pre-existing session is revoked.
+    assert api.request("GET", "/orgs", token=pre).status_code == 401
+    # No leftover valid session for the old password anywhere.
+    # New password works and its session is not revoked.
+    r = api.login(u, "NewPass 2")
+    assert r.status_code == 200
+    assert api.request("GET", "/orgs", token=r.json()["token"]).status_code == 200
