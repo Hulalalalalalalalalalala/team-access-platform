@@ -54,6 +54,15 @@
 - **审计**：组织、邀请、成员的每一次变更与审计行在**同一事务原子提交**，失败无部分写入；
   审计包含组织、操作者、动作、对象、时间戳、前后状态及批量操作的共同 `batch_id`；
   仅本组织管理员可分页查询，不提供任何修改或删除接口。
+  - `GET /orgs/{org_id}/audit/scan` 在游标分批读取的基础上支持首批传 `batch_id`
+    （1–128 字符，原值精确匹配，不去空格 / 不转大小写；空串 / 超长 → 422
+    `validation_error`），只返回本组织属于该批次的成员变更与委托失效记录；
+    不传则查询本组织全部审计。无匹配（含标识只存在于其他组织）一律
+    `200 {items:[], total:0, next_cursor:null}`，不透露其他组织信息。
+  - 筛选条件固化在游标内：后续只传游标即沿用；同时传 `batch_id` 必须与首次完全一致，
+    换批次、给未筛选查询追加条件（含升级前签发的旧游标）→ 422 `invalid_cursor`；
+    快照范围在首批固定，之后新增的同批次记录不进入本次查询，重新发起无游标请求才能看到。
+    每批都重新校验当前组织启用管理员资格，游标不替代授权。
 - **临时委托邀请管理**：启用管理员可指定本组织一名**启用的普通成员**为受托人，
   将邀请管理交托对方一段有限时间（`60..86400` 秒的整数）。受托人在有效期内沿用
   现有邀请入口签发 **member** 邀请，并可撤销自己凭这份委托签发的邀请；不能签发
@@ -207,6 +216,7 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | GET | `/orgs/{org_id}/delegations` | 本组织启用成员（管理员看全部，受托人只看自己） | — |
 | POST | `/orgs/{org_id}/delegations/{delegation_id}/revoke` | 本组织管理员 | — |
 | GET | `/orgs/{org_id}/audit?page=&page_size=` | 本组织管理员 | — |
+| GET | `/orgs/{org_id}/audit/scan?cursor=&batch_id=&page_size=` | 本组织管理员 | — |
 
 ## 错误响应
 
@@ -231,7 +241,8 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | 409 | `delegation_exists` | 同一组织同一成员已有一份有效委托（含并发授予） |
 | 409 | `idempotency_conflict` | 同幂等键但请求体不同（移除为同键换目标 / 换组织） |
 | 404 | `not_found` / `member_not_found` | 路由不存在 / 目标成员不存在（调整或移除单人目标不属于本组织；批量中任一目标不属于本组织则整批 404） |
-| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段） |
+| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段）；审计扫描的 `batch_id` 空串 / 超长、`page_size` 越界 |
+| 422 | `invalid_cursor` | 审计扫描游标伪造 / 损坏 / 属于其他组织，或续批时改变 / 追加 `batch_id` 筛选条件 |
 | 500 | `internal_error` | 服务器内部错误（不泄露细节） |
 
 ## 安全说明

@@ -153,6 +153,31 @@ def db(server) -> sqlite3.Connection:
 
 
 @pytest.fixture()
+def server_sign(server):
+    """Sign text with the RUNNING SERVER's secret key.
+
+    Lets tests hand-mint otherwise-valid signed tokens (e.g. legacy cursors
+    signed before an upgrade); importing app.secret directly would use the
+    test process's own key file, which does not match the server subprocess.
+    """
+    import base64
+    import hashlib
+    import hmac
+
+    def _sign(text: str) -> str:
+        key = server.key_path.read_bytes().strip()
+        raw_key = base64.urlsafe_b64decode(key)
+        sig = hmac.new(raw_key, text.encode("utf-8"), hashlib.sha256).digest()
+        return (
+            base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+            + "."
+            + base64.urlsafe_b64encode(sig).decode("ascii")
+        )
+
+    return _sign
+
+
+@pytest.fixture()
 def make_server():
     """Factory for an isolated server instance (used by restart tests)."""
     created: list[Server] = []

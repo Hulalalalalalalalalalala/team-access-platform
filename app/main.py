@@ -1434,40 +1434,65 @@ def list_audit(
 
 # ------------------------------------------------------------- audit scan
 
-_CURSOR_VERSION = 1
+# Version 1 cursors predate batch filtering and carry no "batch" field; they
+# remain valid for unfiltered scans only. Version 2 embeds the filter (the
+# exact batch_id, or null for an unfiltered scan) so follow-up requests need
+# only carry the cursor.
+_CURSOR_VERSION = 2
+_CURSOR_VERSION_LEGACY = 1
 
 
-def _encode_scan_cursor(org_id: int, end_id: int, position: int) -> str:
+def _encode_scan_cursor(
+    org_id: int, end_id: int, position: int, batch_id: Optional[str]
+) -> str:
     """Opaque continuation token for an audit scan.
 
     The cursor only carries a read position: the organization, the scan's
-    fixed upper id bound (the snapshot end) and the id of the last entry
-    already returned. It is HMAC-signed with the server key, so clients can
-    neither read nor alter it, and deterministic, so re-issuing a cursor for
-    an unchanged position yields the identical string. It never substitutes
-    for authentication — every batch re-checks the caller's current admin
-    membership.
+    fixed upper id bound (the snapshot end), the id of the last entry already
+    returned and the batch filter in effect. It is HMAC-signed with the
+    server key, so clients can neither read nor alter it, and deterministic,
+    so re-issuing a cursor for an unchanged position yields the identical
+    string. It never substitutes for authentication — every batch re-checks
+    the caller's current admin membership.
     """
     payload = json.dumps(
-        {"v": _CURSOR_VERSION, "org": org_id, "end": end_id, "pos": position},
+        {"v": _CURSOR_VERSION, "org": org_id, "end": end_id,
+         "pos": position, "batch": batch_id},
         separators=(",", ":"),
+        ensure_ascii=False,
     )
     return sign_text(payload)
 
 
-def _decode_scan_cursor(cursor: str, org_id: int) -> tuple[int, int]:
-    """Validate a cursor for THIS organization, returning (end_id, position).
+def _decode_scan_cursor(cursor: str, org_id: int) -> tuple[int, int, Optional[str]]:
+    """Validate a cursor's shape for THIS organization.
 
-    Anything unrecognized, tampered with, or minted for another organization
-    is the same 422 invalid_cursor and reveals no audit content.
+    Returns ``(end_id, position, batch_id)`` where ``batch_id`` is the filter
+    the scan was started with (``None`` for an unfiltered scan). Anything
+    unrecognized, tampered with, or minted for another organization raises
+    422 invalid_cursor and reveals no audit content. Whether the request is
+    ALSO allowed to present its own ``batch_id`` beside the cursor is decided
+    by the caller: it must exactly equal the embedded one, and an omitted
+    parameter simply adopts it. Legacy (pre-upgrade) cursors embed ``None``,
+    so they continue only unfiltered scans.
     """
     try:
         payload = json.loads(verify_signed_text(cursor))
+        version = payload["v"]
         end_id = payload["end"]
         position = payload["pos"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError
+        if version == _CURSOR_VERSION_LEGACY:
+            cursor_batch: Optional[str] = None
+        elif version == _CURSOR_VERSION:
+            cursor_batch = payload["batch"]
+            if cursor_batch is not None and not isinstance(cursor_batch, str):
+                raise ValueError
+        else:
+            raise ValueError
         if (
-            payload["v"] != _CURSOR_VERSION
-            or payload["org"] != org_id
+            payload["org"] != org_id
             or not isinstance(end_id, int)
             or not isinstance(position, int)
             or isinstance(end_id, bool)
@@ -1479,13 +1504,14 @@ def _decode_scan_cursor(cursor: str, org_id: int) -> tuple[int, int]:
             raise ValueError
     except Exception:
         raise ApiError(422, "invalid_cursor", "cursor is invalid")
-    return end_id, position
+    return end_id, position, cursor_batch
 
 
 @app.get("/orgs/{org_id}/audit/scan")
 def scan_audit(
     org_id: int,
     cursor: Optional[str] = Query(default=None),
+    batch_id: Optional[str] = Query(default=None, min_length=1, max_length=128),
     page_size: int = Query(default=20, ge=1, le=100),
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
@@ -1495,49 +1521,104 @@ def scan_audit(
     The first request (no ``cursor``) fixes the range as every entry of this
     organization committed at that instant: audit ids are monotonic, so the
     range is exactly ``id <= end_id`` and entries written later — even with
-    an identical timestamp — can never join it. Follow-up requests pass the
-    returned ``next_cursor`` and read strictly after the previous batch's
-    last id, so every in-range entry appears exactly once regardless of how
-    ``page_size`` changes between batches. The cursor is stateless: repeating
-    a request with the same cursor returns the same batch and does not
-    consume progress. Authorization is re-checked on every batch against the
-    caller's CURRENT membership.
+    an identical timestamp — can never join it. Passing ``batch_id`` narrows
+    the range to this organization's rows whose batch marker matches it
+    byte-for-byte (no trimming or case folding); no match — including a marker
+    that only exists in another organization — yields an empty result rather
+    than any hint about other organizations. Follow-up requests pass the
+    returned ``next_cursor`` (the filter rides inside it, so ``batch_id`` is
+    neither needed nor allowed to change) and read strictly after the previous
+    batch's last id, so every in-range entry appears exactly once regardless
+    of how ``page_size`` changes between batches. The cursor is stateless:
+    repeating a request with the same cursor returns the same batch and does
+    not consume progress. Authorization is re-checked on every batch against
+    the caller's CURRENT membership.
     """
+    # Every batch — cursor continuations included — is freshly authorized
+    # against the caller's current membership. A cursor never stands in for
+    # authorization: a member demoted or disabled mid-scan is refused on the
+    # next batch with the uniform 403.
     require_membership(conn, user, org_id, admin=True)
     if cursor is None:
-        # Fix the snapshot range [.., end_id] for this organization only;
-        # rows committed by other orgs interleave in id space but are
-        # filtered out without affecting order or completeness.
-        snap = conn.execute(
-            "SELECT MAX(id) AS end_id, COUNT(*) AS n FROM audit_logs WHERE org_id = ?",
-            (org_id,),
-        ).fetchone()
+        # Fix the snapshot range [.., end_id] for THIS organization (and, when
+        # given, this batch) only; rows committed by other orgs interleave in
+        # id space but are filtered out without affecting order/completeness.
+        if batch_id is None:
+            snap = conn.execute(
+                "SELECT MAX(id) AS end_id, COUNT(*) AS n FROM audit_logs WHERE org_id = ?",
+                (org_id,),
+            ).fetchone()
+        else:
+            # Bound the range at the filtered set's own last id. This keeps
+            # the (position > end_id) cursor invariant meaningful and changes
+            # nothing about visibility: later rows of the SAME batch cannot
+            # exist (its rows commit in one transaction), and later batches
+            # never carry this marker.
+            snap = conn.execute(
+                "SELECT MAX(id) AS end_id, COUNT(*) AS n FROM audit_logs"
+                " WHERE org_id = ? AND batch_id = ?",
+                (org_id, batch_id),
+            ).fetchone()
         end_id = snap["end_id"] or 0
         total = snap["n"]
         position = 0
     else:
-        end_id, position = _decode_scan_cursor(cursor, org_id)
+        # Raises 422 invalid_cursor on malformed/tampered/foreign cursors.
+        # Happens AFTER the membership check, so a cursor never bypasses it.
+        end_id, position, cursor_batch = _decode_scan_cursor(cursor, org_id)
+        # Follow-up requests normally omit batch_id and simply inherit the
+        # filter frozen into the cursor. Explicitly presenting one is allowed
+        # only when it reproduces the FIRST request's filter byte-for-byte;
+        # switching batches, adding a filter to an unfiltered scan or dropping
+        # the filter from a filtered one (covered by the embedded value below)
+        # are all invalid_cursor.
+        if batch_id is not None and batch_id != cursor_batch:
+            raise ApiError(422, "invalid_cursor", "cursor is invalid")
+        batch_id = cursor_batch
         # Audit rows are never updated or deleted, so the in-range total is
         # identical for every batch of the scan.
-        total = conn.execute(
-            "SELECT COUNT(*) AS n FROM audit_logs WHERE org_id = ? AND id <= ?",
-            (org_id, end_id),
-        ).fetchone()["n"]
+        if batch_id is None:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_logs WHERE org_id = ? AND id <= ?",
+                (org_id, end_id),
+            ).fetchone()["n"]
+        else:
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_logs"
+                " WHERE org_id = ? AND batch_id = ? AND id <= ?",
+                (org_id, batch_id, end_id),
+            ).fetchone()["n"]
     # Fetch one extra row to learn whether a further batch exists; this ends
     # the scan with next_cursor = null exactly when the final batch is full.
-    rows = conn.execute(
-        """
-        SELECT a.*, u.username AS actor_username
-        FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
-        WHERE a.org_id = ? AND a.id > ? AND a.id <= ?
-        ORDER BY a.id ASC
-        LIMIT ?
-        """,
-        (org_id, position, end_id, page_size + 1),
-    ).fetchall()
+    if batch_id is None:
+        rows = conn.execute(
+            """
+            SELECT a.*, u.username AS actor_username
+            FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+            WHERE a.org_id = ? AND a.id > ? AND a.id <= ?
+            ORDER BY a.id ASC
+            LIMIT ?
+            """,
+            (org_id, position, end_id, page_size + 1),
+        ).fetchall()
+    else:
+        # Exact-match, case/space-sensitive parameter comparison; the org
+        # predicate guarantees another organization's batch can never appear.
+        rows = conn.execute(
+            """
+            SELECT a.*, u.username AS actor_username
+            FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+            WHERE a.org_id = ? AND a.batch_id = ? AND a.id > ? AND a.id <= ?
+            ORDER BY a.id ASC
+            LIMIT ?
+            """,
+            (org_id, batch_id, position, end_id, page_size + 1),
+        ).fetchall()
     has_more = len(rows) > page_size
     items = [_audit_item(r) for r in rows[:page_size]]
     next_cursor = (
-        _encode_scan_cursor(org_id, end_id, items[-1]["id"]) if has_more else None
+        _encode_scan_cursor(org_id, end_id, items[-1]["id"], batch_id)
+        if has_more
+        else None
     )
     return {"items": items, "total": total, "next_cursor": next_cursor}

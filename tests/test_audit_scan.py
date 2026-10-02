@@ -1,6 +1,8 @@
 """Audit scan: snapshot-consistent cursor iteration over the audit trail."""
 from __future__ import annotations
 
+import json
+
 from tests.conftest import Api
 
 
@@ -10,6 +12,50 @@ def _invite_member(api: Api, admin_token, org_id: int, role: str = "member"):
                       json={"username": name, "role": role}).json()
     api.request("POST", "/invites/accept", token=token, json={"token": inv["token"]})
     return name, token
+
+
+def _invite_member_id(api: Api, admin_token, org_id: int, role: str = "member"):
+    name, token = _invite_member(api, admin_token, org_id, role)
+    uid = api.request("GET", f"/orgs/{org_id}/members/me",
+                      token=token).json()["membership"]["user_id"]
+    return name, token, uid
+
+
+def _batch(api: Api, token: str, org_id: int, changes: list[dict]) -> str:
+    r = api.request("PATCH", f"/orgs/{org_id}/members/batch", token=token,
+                    json={"changes": changes})
+    assert r.status_code == 200, r.text
+    return r.json()["batch_id"]
+
+
+def _org_with_two_batches(api: Api):
+    """Org whose audit trail mixes batch and non-batch rows.
+
+    Batch A disables two members, one of them an active delegate, so it
+    contains 2 member.updated rows and 1 delegation.invalidated row.
+    Batch B re-enables that member and disables another: 2 member.updated
+    rows and no delegation rows (invalidation is permanent).
+    """
+    _, admin_token = api.new_user()
+    org = api.request("POST", "/orgs", token=admin_token,
+                      json={"name": f"bscan-{api.unique()}"}).json()
+    people = [_invite_member_id(api, admin_token, org["id"]) for _ in range(4)]
+    m1, m2, m3, m4 = (p[2] for p in people)
+
+    r = api.request("POST", f"/orgs/{org['id']}/delegations", token=admin_token,
+                    json={"user_id": m1, "duration_seconds": 3600})
+    assert r.status_code == 201, r.text
+
+    batch_a = _batch(api, admin_token, org["id"], [
+        {"user_id": m1, "status": "disabled"},
+        {"user_id": m2, "status": "disabled"},
+    ])
+    batch_b = _batch(api, admin_token, org["id"], [
+        {"user_id": m1, "status": "active"},
+        {"user_id": m3, "status": "disabled"},
+    ])
+    return admin_token, org["id"], batch_a, batch_b, people
+
 
 
 def _make_org_with_audit(api: Api, admin_token, actions: int):
@@ -22,15 +68,18 @@ def _make_org_with_audit(api: Api, admin_token, actions: int):
     return org
 
 
-def _scan_all(api: Api, token, org_id: int, page_size: int = 2):
+def _scan_all(api: Api, token, org_id: int, page_size: int = 2, batch_id=None):
     """Drive a full scan; return (batches, final_response)."""
     batches = []
     cursor = None
     while True:
-        params = f"page_size={page_size}"
+        params: dict[str, object] = {"page_size": page_size}
+        if batch_id is not None:
+            params["batch_id"] = batch_id
         if cursor is not None:
-            params += f"&cursor={cursor}"
-        r = api.request("GET", f"/orgs/{org_id}/audit/scan?{params}", token=token)
+            params["cursor"] = cursor
+        r = api.request("GET", f"/orgs/{org_id}/audit/scan", token=token,
+                        params=params)
         assert r.status_code == 200, r.text
         data = r.json()
         batches.append(data)
@@ -226,6 +275,7 @@ def test_scan_cursor_does_not_replace_authorization(api: Api):
     assert api.request("GET", f"/orgs/{org['id']}/audit/scan?cursor={cursor}",
                        token=second_token2).status_code == 403
 
+
     # ...but the still-admin user continues the original range with the
     # same cursor (any valid session of theirs works).
     r2 = api.request("GET", f"/orgs/{org['id']}/audit/scan?cursor={cursor}",
@@ -289,3 +339,353 @@ def test_paged_endpoint_unchanged(api: Api):
     page2 = api.request("GET", f"/orgs/{org['id']}/audit?page=2&page_size=2",
                         token=admin_token).json()
     assert page2["items"][0]["id"] > ids[-1]
+
+
+# ====================================================== batch_id filtering
+
+def test_scan_batch_filter_returns_only_that_batch_ascending(api: Api):
+    admin, org, batch_a, batch_b, _ = _org_with_two_batches(api)
+
+    r = api.request("GET", f"/orgs/{org}/audit/scan?page_size=20&batch_id={batch_a}",
+                    token=admin)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 2 member changes + 1 delegation invalidation, all carrying batch A.
+    assert len(data["items"]) == 3
+    assert data["total"] == 3 and data["next_cursor"] is None
+    ids = [i["id"] for i in data["items"]]
+    assert ids == sorted(ids)
+    assert {i["batch_id"] for i in data["items"]} == {batch_a}
+    assert {i["action"] for i in data["items"]} == {
+        "member.updated", "delegation.invalidated"}
+    # Fields are the same the unfiltered scan exposes.
+    assert set(data["items"][0]) == {"id", "org_id", "created_at", "actor_id",
+                                    "actor_username", "action", "target_type",
+                                    "target_id", "before", "after", "batch_id"}
+    assert all(i["org_id"] == org for i in data["items"])
+
+    # The other batch is an independent range.
+    rb = api.request("GET", f"/orgs/{org}/audit/scan?page_size=20&batch_id={batch_b}",
+                     token=admin).json()
+    assert len(rb["items"]) == 2 and rb["total"] == 2 and rb["next_cursor"] is None
+    assert {i["batch_id"] for i in rb["items"]} == {batch_b}
+    assert {i["action"] for i in rb["items"]} == {"member.updated"}
+
+
+def test_scan_batch_filter_paginates_without_gaps_or_dupes(api: Api):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)  # 3 matching rows
+
+    r1 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                     token=admin).json()
+    assert len(r1["items"]) == 1 and r1["total"] == 3
+    assert r1["items"][0]["batch_id"] == batch_a
+
+    # Continuation needs just the cursor; the filter rides inside it.
+    r2 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=1&cursor={r1['next_cursor']}",
+                     token=admin).json()
+    assert len(r2["items"]) == 1 and r2["total"] == 3
+    # page_size may change between batches.
+    r3 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=20&cursor={r2['next_cursor']}",
+                     token=admin).json()
+    assert len(r3["items"]) == 1 and r3["total"] == 3 and r3["next_cursor"] is None
+
+    ids = [i["id"] for r in (r1, r2, r3) for i in r["items"]]
+    assert ids == sorted(ids) and len(ids) == len(set(ids)) == 3
+
+
+def test_scan_batch_filter_full_last_batch_ends(api: Api):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)  # 3 matching rows
+
+    # page_size equal to the match count: a single exactly-full batch ends.
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?page_size=3&batch_id={batch_a}",
+                    token=admin).json()
+    assert len(r["items"]) == 3 and r["total"] == 3 and r["next_cursor"] is None
+
+    # Two full batches with page_size that divides evenly must also end.
+    batches, last = _scan_all(api, admin, org, page_size=3, batch_id=batch_a)
+    assert len(batches) == 1 and last["next_cursor"] is None
+
+
+def test_scan_batch_filter_unknown_batch_is_empty_200(api: Api):
+    admin, org, _, other_batch, _ = _org_with_two_batches(api)
+
+    # Marker that exists nowhere.
+    r = api.request("GET", f"/orgs/{org}/audit/scan?batch_id=b_doesnotexist000000000000",
+                    token=admin)
+    assert r.status_code == 200
+    assert r.json() == {"items": [], "total": 0, "next_cursor": None}
+
+    # A marker of ANOTHER org's batch reveals nothing here.
+    _, admin2 = api.new_user()
+    org2 = api.request("POST", "/orgs", token=admin2,
+                       json={"name": f"other-{api.unique()}"}).json()
+    r = api.request("GET",
+                    f"/orgs/{org2['id']}/audit/scan?batch_id={other_batch}",
+                    token=admin2)
+    assert r.status_code == 200
+    assert r.json() == {"items": [], "total": 0, "next_cursor": None}
+
+
+def test_scan_batch_filter_exact_match_preserves_space_and_case(api: Api):
+    admin, org, batch_a, batch_b, _ = _org_with_two_batches(api)
+    # Case folding and whitespace trimming must NOT happen: variants match
+    # nothing but still return the normal empty 200.
+    for variant in (" " + batch_a, batch_a.upper(), batch_a + " "):
+        r = api.request("GET", f"/orgs/{org}/audit/scan", token=admin,
+                        params={"batch_id": variant, "page_size": 20})
+        assert r.status_code == 200
+        assert r.json() == {"items": [], "total": 0, "next_cursor": None}
+    # The unmodified value still matches.
+    r = api.request("GET", f"/orgs/{org}/audit/scan", token=admin,
+                    params={"batch_id": batch_a, "page_size": 20})
+    assert r.status_code == 200 and r.json()["total"] == 3
+    # A batch id consisting solely of spaces is a valid 1..128-char exact
+    # value: it matches no rows, it is not "empty input".
+    r = api.request("GET", f"/orgs/{org}/audit/scan", token=admin,
+                    params={"batch_id": "   "})
+    assert r.status_code == 200 and r.json()["total"] == 0
+
+
+def test_scan_batch_filter_param_validation(api: Api):
+    admin, org, _, _, _ = _org_with_two_batches(api)
+
+    # Empty string -> 422 validation_error (it is "not provided", not a value).
+    r = api.request("GET", f"/orgs/{org}/audit/scan?batch_id=", token=admin)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "validation_error"
+
+    # Overlong -> 422 validation_error.
+    r = api.request("GET", f"/orgs/{org}/audit/scan", token=admin,
+                    params={"batch_id": "b" * 129})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "validation_error"
+
+    # Exactly 128 chars is accepted (matches nothing -> empty 200).
+    r = api.request("GET", f"/orgs/{org}/audit/scan", token=admin,
+                    params={"batch_id": "x" * 128})
+    assert r.status_code == 200
+    assert r.json() == {"items": [], "total": 0, "next_cursor": None}
+
+
+def test_scan_batch_filter_snapshot_with_injected_later_row(api, db):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)  # 3 rows for A
+
+    r1 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=2&batch_id={batch_a}",
+                     token=admin).json()
+    assert r1["total"] == 3 and r1["next_cursor"] is not None
+
+    # Commit a NEWER row tagged with the identical batch marker after the scan
+    # began. It must not enter the fixed range even though marker and even a
+    # coincident timestamp would match.
+    db.execute(
+        "INSERT INTO audit_logs (org_id, actor_id, action, target_type,"
+        " target_id, before_state, after_state, batch_id, created_at)"
+        " SELECT org_id, actor_id, action, target_type, target_id,"
+        " before_state, after_state, ?, created_at FROM audit_logs"
+        " WHERE batch_id = ? LIMIT 1",
+        (batch_a, batch_a),
+    )
+    db.commit()
+
+    r2 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=2&cursor={r1['next_cursor']}",
+                     token=admin).json()
+    ids = [i["id"] for i in r1["items"]] + [i["id"] for i in r2["items"]]
+    assert len(ids) == 3
+    assert r2["total"] == 3 and r2["next_cursor"] is None
+
+    # A fresh filtered scan (no cursor) starts a new range including the row.
+    r3 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=20&batch_id={batch_a}",
+                     token=admin).json()
+    assert r3["total"] == 4 and len(r3["items"]) == 4 and r3["next_cursor"] is None
+
+
+def test_scan_batch_filter_repeat_cursor_idempotent(api: Api):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)  # 3 rows
+
+    r1 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                     token=admin).json()
+    cursor = r1["next_cursor"]
+    a = api.request("GET", f"/orgs/{org}/audit/scan?page_size=1&cursor={cursor}",
+                    token=admin).json()
+    b = api.request("GET", f"/orgs/{org}/audit/scan?page_size=1&cursor={cursor}",
+                    token=admin).json()
+    assert a == b
+    assert {i["batch_id"] for i in a["items"]} == {batch_a}
+
+
+def test_scan_batch_filter_cursor_rejects_changed_or_added_batch(api: Api):
+    admin, org, batch_a, batch_b, _ = _org_with_two_batches(api)
+
+    # Cursor minted for batch A ...
+    c_a = api.request("GET",
+                      f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                      token=admin).json()["next_cursor"]
+    # ... cannot continue batch B.
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={c_a}&batch_id={batch_b}",
+                    token=admin)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+    # Repeating the SAME batch alongside the cursor is allowed.
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={c_a}&batch_id={batch_a}",
+                    token=admin)
+    assert r.status_code == 200
+
+    # A cursor from an UNFILTERED scan rejects an added batch filter.
+    c_all = api.request("GET", f"/orgs/{org}/audit/scan?page_size=1",
+                        token=admin).json()["next_cursor"]
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={c_all}&batch_id={batch_a}",
+                    token=admin)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+    # A filtered cursor with NO batch_id presented simply inherits its
+    # embedded filter and continues the same filtered scan.
+    r = api.request("GET", f"/orgs/{org}/audit/scan?cursor={c_a}", token=admin)
+    assert r.status_code == 200
+    assert {i["batch_id"] for i in r.json()["items"]} == {batch_a}
+
+
+def test_scan_batch_filter_cursor_bound_to_org(api: Api):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)
+    c = api.request("GET",
+                    f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                    token=admin).json()["next_cursor"]
+    org2 = _make_org_with_audit(api, admin, 1)
+    r = api.request("GET",
+                    f"/orgs/{org2['id']}/audit/scan?cursor={c}&batch_id={batch_a}",
+                    token=admin)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_scan_batch_filter_auth_enforced_every_batch(api: Api):
+    admin, org, batch_a, _, people = _org_with_two_batches(api)
+    member_token = people[3][1]
+    disabled_token = people[1][1]   # m2 ends disabled after batch A
+
+    # 401 unauthenticated even with a filter.
+    r = api.request("GET", f"/orgs/{org}/audit/scan",
+                    params={"batch_id": batch_a})
+    assert r.status_code == 401
+    # Plain member, disabled member, outsider, unknown org -> uniform 403.
+    _, outsider = api.new_user()
+    assert api.request("GET", f"/orgs/{org}/audit/scan", token=member_token,
+                       params={"batch_id": batch_a}).status_code == 403
+    assert api.request("GET", f"/orgs/{org}/audit/scan", token=disabled_token,
+                       params={"batch_id": batch_a}).status_code == 403
+    assert api.request("GET", f"/orgs/{org}/audit/scan", token=outsider,
+                       params={"batch_id": batch_a}).status_code == 403
+    assert api.request("GET", "/orgs/999999999/audit/scan", token=admin,
+                       params={"batch_id": batch_a}).status_code == 403
+
+    # A delegate is still an ordinary member for audit reads: 403 even with
+    # an active delegation, on both filtered and unfiltered scans.
+    r = api.request("POST", f"/orgs/{org}/delegations", token=admin,
+                    json={"user_id": people[3][2], "duration_seconds": 3600})
+    assert r.status_code == 201, r.text
+    assert api.request("GET", f"/orgs/{org}/audit/scan", token=member_token,
+                       params={"batch_id": batch_a}).status_code == 403
+
+    # Demote the admin mid-scan: the cursor continuation is refused.
+    second_name, second_token, second_id = _invite_member_id(
+        api, admin, org, role="admin")
+    r1 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                     token=second_token).json()
+    api.request("PATCH", f"/orgs/{org}/members/{second_id}", token=admin,
+                json={"role": "member"})
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={r1['next_cursor']}",
+                    token=second_token)
+    assert r.status_code == 403
+    # Fresh login does not restore access; the still-admin caller continues.
+    assert api.request(
+        "GET", f"/orgs/{org}/audit/scan?cursor={r1['next_cursor']}",
+        token=api.token_for(second_name)).status_code == 403
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={r1['next_cursor']}",
+                    token=admin)
+    assert r.status_code == 200 and r.json()["items"]
+
+    # An admin DISABLED mid-filtered-scan is likewise refused on the next
+    # batch, even after a fresh login.
+    third_name, third_token, third_id = _invite_member_id(
+        api, admin, org, role="admin")
+    r1 = api.request("GET",
+                     f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                     token=third_token).json()
+    api.request("PATCH", f"/orgs/{org}/members/{third_id}", token=admin,
+                json={"status": "disabled"})
+    assert api.request(
+        "GET", f"/orgs/{org}/audit/scan?cursor={r1['next_cursor']}",
+        token=api.token_for(third_name)).status_code == 403
+
+
+def test_scan_batch_filter_is_read_only(api: Api, db):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)
+    before = db.execute("SELECT COUNT(*) AS n FROM audit_logs").fetchone()["n"]
+    _scan_all(api, admin, org, page_size=1, batch_id=batch_a)
+    after = db.execute("SELECT COUNT(*) AS n FROM audit_logs").fetchone()["n"]
+    assert before == after
+
+
+def test_scan_legacy_v1_cursor_valid_only_unfiltered(api: Api, server_sign):
+    """A cursor signed before the upgrade (no batch field) keeps working."""
+    _, admin_token = api.new_user()
+    org = _make_org_with_audit(api, admin_token, 3)  # 4 rows
+
+    first = api.request("GET", f"/orgs/{org['id']}/audit/scan?page_size=20",
+                        token=admin_token).json()
+    max_id = max(i["id"] for i in first["items"])
+    # Mint a legacy v1 cursor directly with the SERVER's key:
+    # {"v":1,"org","end","pos"}, no batch field.
+    legacy = server_sign(json.dumps(
+        {"v": 1, "org": org["id"], "end": max_id, "pos": 0},
+        separators=(",", ":")))
+
+    # Still valid for an unfiltered continuation...
+    r = api.request("GET",
+                    f"/orgs/{org['id']}/audit/scan?page_size=2&cursor={legacy}",
+                    token=admin_token)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert len(data["items"]) == 2 and data["total"] == 4
+    assert [i["id"] for i in data["items"]] == sorted(i["id"] for i in first["items"])[:2]
+
+    # ...but attaching any batch_id to it is invalid_cursor.
+    r = api.request("GET",
+                    f"/orgs/{org['id']}/audit/scan?page_size=2&cursor={legacy}"
+                    "&batch_id=b_whatever0000000000000000000000000000",
+                    token=admin_token)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_scan_batch_filter_new_cursor_is_v2_and_opaque(api: Api):
+    admin, org, batch_a, _, _ = _org_with_two_batches(api)
+    c = api.request("GET",
+                    f"/orgs/{org}/audit/scan?page_size=1&batch_id={batch_a}",
+                    token=admin).json()["next_cursor"]
+    # Opaque signed token; the raw batch id never appears inside it.
+    assert batch_a not in c
+    # Tampering flips it back to invalid_cursor.
+    tampered = c[:-4] + ("AAAA" if c[-4:] != "AAAA" else "BBBB")
+    r = api.request("GET",
+                    f"/orgs/{org}/audit/scan?cursor={tampered}&batch_id={batch_a}",
+                    token=admin)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "invalid_cursor"
+
+
