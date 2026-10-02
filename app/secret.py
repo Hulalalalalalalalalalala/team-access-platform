@@ -51,3 +51,14 @@ def encrypt_text(text: str) -> str:
 
 def decrypt_text(token: str) -> str:
     return _load().decrypt(token.encode("ascii")).decode("utf-8")
+
+
+def key_bytes() -> bytes:
+    """Raw bytes of the local secret key, for HMAC-signed tokens.
+
+    Used by audit scan cursors: a deterministic signature makes identical
+    requests return byte-identical cursors (true idempotency), and HMAC
+    verification rejects tampering without encrypting the payload.
+    """
+    _load()  # ensures the key file exists
+    return _KEY_FILE.read_bytes().strip()

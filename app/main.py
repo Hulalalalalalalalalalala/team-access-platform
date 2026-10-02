@@ -24,10 +24,11 @@ Invitations
 
 Audit
   GET /orgs/{org_id}/audit?page=&page_size=   admins only, paged read-only
+  GET /orgs/{org_id}/audit/scan?cursor=&page_size=
+      admins only, stable-range cursor scan (new rows after start excluded)
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 import sqlite3
@@ -38,6 +39,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 
 from . import config, idempotency
 from .audit import add_audit
+from .audit_scan import InvalidCursor, audit_item_dict, scan_page
 from .auth import CurrentUser, _extract_token, current_user, require_membership
 from .db import get_conn, init_db, transaction
 from .errors import (
@@ -1408,20 +1410,31 @@ def list_audit(
         """,
         (org_id, page_size, (page - 1) * page_size),
     ).fetchall()
-    items = [
-        {
-            "id": r["id"],
-            "org_id": r["org_id"],
-            "created_at": r["created_at"],
-            "actor_id": r["actor_id"],
-            "actor_username": r["actor_username"],
-            "action": r["action"],
-            "target_type": r["target_type"],
-            "target_id": r["target_id"],
-            "before": json.loads(r["before_state"]) if r["before_state"] else None,
-            "after": json.loads(r["after_state"]) if r["after_state"] else None,
-            "batch_id": r["batch_id"],
-        }
-        for r in rows
-    ]
+    items = [audit_item_dict(r) for r in rows]
     return {"page": page, "page_size": page_size, "total": total, "items": items}
+
+
+@app.get("/orgs/{org_id}/audit/scan")
+def scan_audit(
+    org_id: int,
+    page_size: int = Query(default=20, ge=1, le=100),
+    cursor: Optional[str] = Query(default=None),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Stable-range cursor scan of an organization's audit log.
+
+    The FIRST request (no cursor) fixes the range to the rows currently
+    committed; later requests walk that range with the returned cursor.
+    Every batch re-checks the caller's admin membership, so a demoted
+    admin cannot continue and a different valid session can. A cursor
+    that is unrecognizable, tampered with or belongs to another org is
+    rejected with 422 invalid_cursor (after the permission check).
+    """
+    # Permission first: no valid session -> 401, non-member/disabled/
+    # non-admin/missing org -> uniform 403.
+    require_membership(conn, user, org_id, admin=True)
+    try:
+        return scan_page(conn, org_id=org_id, page_size=page_size, cursor=cursor)
+    except InvalidCursor:
+        raise ApiError(422, "invalid_cursor", "invalid scan cursor")

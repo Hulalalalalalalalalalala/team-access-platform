@@ -54,6 +54,18 @@
 - **审计**：组织、邀请、成员的每一次变更与审计行在**同一事务原子提交**，失败无部分写入；
   审计包含组织、操作者、动作、对象、时间戳、前后状态及批量操作的共同 `batch_id`；
   仅本组织管理员可分页查询，不提供任何修改或删除接口。
+  - **连续扫描**：`GET /orgs/{org_id}/audit/scan` 让管理员连续读取**开始查看时已提交**的记录。
+    首次请求（不带 `cursor`）确定范围（`items` / `total` / `next_cursor`），范围固定后
+    期间新增的审计留待下一次不带 `cursor` 的新范围。`items` 沿用审计条目的全部公开字段，
+    按编号升序；`total` 是范围内记录总数，各批一致。`page_size` 默认 20，允许 1–100，
+    继续读取时可调整数量，不改变范围或漏掉记录。还有未读时 `next_cursor` 返回非空字符串，
+    读完返回 `null`（末批恰好达到每批数量也直接结束）；无记录时返回空列表、`total` 为 0、
+    `next_cursor` 为 `null`。后续请求把收到的 `next_cursor` 作为 `cursor` 继续，从上一批
+    最后一条之后返回。游标是 HMAC 签名的不透明字符串，只表示读取位置，不代替登录或管理员
+    资格：每批都按当前身份检查权限（401 / 403）；权限通过后，无法识别、被改动或属于其他
+    组织的游标返回 `422 invalid_cursor`，`page_size` 非法返回 `422 validation_error`。
+    相同 `cursor` 与 `page_size` 重复请求返回相同条目与相同游标，不消耗读取进度；重新不带
+    `cursor` 请求才开始新范围。扫描不新增审计，也不改变组织、成员或已有审计记录。
 - **临时委托邀请管理**：启用管理员可指定本组织一名**启用的普通成员**为受托人，
   将邀请管理交托对方一段有限时间（`60..86400` 秒的整数）。受托人在有效期内沿用
   现有邀请入口签发 **member** 邀请，并可撤销自己凭这份委托签发的邀请；不能签发
@@ -142,6 +154,11 @@ curl -s $B/orgs/1/members -H "Authorization: Bearer $TOK_B"             # 成员
 curl -s $B/orgs/1/members/me -H "Authorization: Bearer $TOK_B"          # 自己的状态
 curl -s "$B/orgs/1/audit?page=1&page_size=20" -H "Authorization: Bearer $TOK_A"  # 管理员审计
 
+# 7a. 连续扫描审计（首次不带 cursor，固定范围；后续用 next_cursor 继续）
+curl -s "$B/orgs/1/audit/scan?page_size=20" -H "Authorization: Bearer $TOK_A"
+# -> {"items":[...],"total":N,"next_cursor":"<非空字符串或null>"}
+curl -s "$B/orgs/1/audit/scan?page_size=20&cursor=<next_cursor>" -H "Authorization: Bearer $TOK_A"
+
 # 7. 管理员调整成员（2 是 bob 的 user_id；同样支持 Idempotency-Key）
 curl -s -X PATCH $B/orgs/1/members/2 -H "Authorization: Bearer $TOK_A" \
   -H 'Content-Type: application/json' -d '{"role":"admin"}'
@@ -207,6 +224,7 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | GET | `/orgs/{org_id}/delegations` | 本组织启用成员（管理员看全部，受托人只看自己） | — |
 | POST | `/orgs/{org_id}/delegations/{delegation_id}/revoke` | 本组织管理员 | — |
 | GET | `/orgs/{org_id}/audit?page=&page_size=` | 本组织管理员 | — |
+| GET | `/orgs/{org_id}/audit/scan?cursor=&page_size=` | 本组织管理员 | — |
 
 ## 错误响应
 
@@ -231,7 +249,8 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | 409 | `delegation_exists` | 同一组织同一成员已有一份有效委托（含并发授予） |
 | 409 | `idempotency_conflict` | 同幂等键但请求体不同（移除为同键换目标 / 换组织） |
 | 404 | `not_found` / `member_not_found` | 路由不存在 / 目标成员不存在（调整或移除单人目标不属于本组织；批量中任一目标不属于本组织则整批 404） |
-| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段） |
+| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段、扫描 `page_size` 非法） |
+| 422 | `invalid_cursor` | 扫描游标无法识别、被改动或属于其他组织（权限检查通过后才返回） |
 | 500 | `internal_error` | 服务器内部错误（不泄露细节） |
 
 ## 安全说明
