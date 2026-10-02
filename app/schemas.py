@@ -39,6 +39,13 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=1, max_length=256)
 
 
+class LogoutOthersRequest(BaseModel):
+    # Required string of 1..256 chars; pydantic does not strip or coerce, so
+    # spaces and case inside the password are preserved and missing/null/
+    # non-string values are rejected with the stable 422 envelope.
+    current_password: str = Field(min_length=1, max_length=256)
+
+
 class CreateOrgRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
 

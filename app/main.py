@@ -6,6 +6,8 @@ Auth
   POST /auth/register   register with unique username + password
   POST /auth/login      start a session (returns opaque token once)
   POST /auth/logout     invalidate the current session immediately
+  POST /auth/logout-others
+                        invalidate every OTHER live session of the account
   POST /auth/password   change own password (revokes all sessions)
 
 Organizations
@@ -58,6 +60,7 @@ from .schemas import (
     CreateInviteRequest,
     CreateOrgRequest,
     LoginRequest,
+    LogoutOthersRequest,
     RegisterRequest,
     RevokeInviteRequest,
     UpdateMemberRequest,
@@ -211,6 +214,64 @@ def logout(
             (now_ts(), user.session_id),
         )
     return {"logged_out": True}
+
+
+@app.post("/auth/logout-others")
+def logout_others(
+    body: LogoutOthersRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+) -> dict[str, int]:
+    """Revoke every OTHER live session of the caller's account.
+
+    Keeps the session making the request (its expiry is untouched) while
+    ending the same account's sessions on every other device, without
+    changing the password. Works for any authenticated account — organization
+    membership or member status is irrelevant. Body validation (422) happens
+    before the session check, so malformed bodies never reveal session state.
+    The revocation is a single UPDATE inside one transaction: every other
+    live session is revoked together or, if the write fails, none is (the
+    generic handler then answers 500 internal_error). Already logged-out or
+    already expired sessions are not counted in ``revoked_sessions``.
+    """
+    token = _extract_token(authorization, x_session_token)
+    if not token:
+        raise unauthorized()
+    ts = now_ts()
+    with transaction(conn):
+        # The session is (re-)validated INSIDE the write transaction.
+        # BEGIN IMMEDIATE serializes concurrent logout-others requests (and
+        # password changes) for the same account, so a second in-flight
+        # request observes the revocation committed by the winner and fails closed
+        # with 401 — exactly one concurrent attempt can succeed, and a
+        # session that was logged out, revoked or expired after the request
+        # started cannot go on to revoke the others.
+        row = conn.execute(
+            """
+            SELECT s.id AS session_id, s.expires_at, s.revoked_at,
+                   u.id AS user_id, u.password_hash AS password_hash
+            FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (hash_token(token),),
+        ).fetchone()
+        if row is None or row["revoked_at"] is not None or row["expires_at"] <= ts:
+            raise unauthorized("invalid or expired session")
+        if not verify_password(body.current_password, row["password_hash"]):
+            # Wrong current password: nothing changes (no session revoked).
+            raise ApiError(403, "invalid_current_password", "current password is incorrect")
+        # Revoke every still-live session of THIS account except the
+        # requesting one. Sessions already revoked or already expired
+        # (expires_at <= now) are left as they are and not counted. Other
+        # accounts, the password, memberships and roles are untouched.
+        cur = conn.execute(
+            "UPDATE sessions SET revoked_at = ?"
+            " WHERE user_id = ? AND id != ? AND revoked_at IS NULL AND expires_at > ?",
+            (ts, row["user_id"], row["session_id"], ts),
+        )
+        revoked = cur.rowcount
+    return {"revoked_sessions": revoked}
 
 
 @app.post("/auth/password")

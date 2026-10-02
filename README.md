@@ -7,6 +7,10 @@
 - **账号 / 会话**：唯一用户名 + 密码注册、登录、退出；用户名重复返回 `409`；
   密码使用 PBKDF2-HMAC-SHA256 加盐哈希存储，永不明文落盘或出现在任何响应中；
   退出立即吊销当前会话（不影响该用户其他会话）。
+  `POST /auth/logout-others`（请求体 `current_password`）保留当前会话、
+  吊销同账号其他所有有效会话并返回 `{"revoked_sessions":N}`（不含当前会话、
+  已退出或已过期会话）；未加入组织、被停用或移除的账号同样可用；
+  密码错误返回 `403 invalid_current_password`，任何失败都不吊销会话。
 - **组织与角色**：登录用户可创建组织并自动成为管理员，也可加入多个组织；
   角色仅 `admin`（管理员）与 `member`（普通成员）两种。
   - 管理员：管理成员（改角色 / 停用 / 恢复）、签发与撤销邀请、分页查询审计。
@@ -174,6 +178,11 @@ curl -s -X DELETE $B/orgs/1/members/2 -H "Authorization: Bearer $TOK_A" \
 # 8. 退出（当前会话立即失效）
 curl -s -X POST $B/auth/logout -H "Authorization: Bearer $TOK_A"
 
+# 8b. 退出其他会话（保留当前会话，结束同账号其他设备登录；需当前密码）
+curl -s -X POST $B/auth/logout-others -H "Authorization: Bearer $TOK_A" \
+  -H 'Content-Type: application/json' -d '{"current_password":"Wonderland1"}'
+# -> {"revoked_sessions":N}
+
 # 9. 临时委托邀请管理（受托人仍是普通成员，不计入最后管理员约束）
 # 9a. 管理员授予：bob 可在 3600 秒内签发 member 邀请
 BOB_ID=$(curl -s $B/orgs/1/members -H "Authorization: Bearer $TOK_A" \
@@ -202,6 +211,7 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | POST | `/auth/register` | 无 | — |
 | POST | `/auth/login` | 无 | — |
 | POST | `/auth/logout` | 登录用户 | — |
+| POST | `/auth/logout-others` | 登录用户（不要求组织成员身份） | — |
 | POST | `/orgs` | 登录用户 | ✔ |
 | GET | `/orgs` | 登录用户 | — |
 | GET | `/orgs/{org_id}/members` | 本组织启用成员 | — |
