@@ -31,6 +31,22 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class ChangePasswordRequest(BaseModel):
+    # Both fields are plain strings of 1..256 chars; spaces and case are
+    # preserved. The explicit before-validator guarantees non-string values
+    # (ints, bools, lists, dicts, None) are 422 validation_error rather than
+    # being coerced or silently accepted.
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("current_password", "new_password", mode="before")
+    @classmethod
+    def _must_be_string(cls, v: object) -> object:
+        if not isinstance(v, str):
+            raise ValueError("must be a string")
+        return v
+
+
 class CreateOrgRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
 
