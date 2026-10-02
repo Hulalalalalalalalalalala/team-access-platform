@@ -176,6 +176,45 @@ def _user_id(api: Api, username: str) -> int:
     return r.json()["user"]["id"]
 
 
+def test_old_password_login_racing_change_never_leaves_live_token(api: Api):
+    """A login verified with the old password must not bypass a password
+    change that takes effect before the login's session is established."""
+    u = api.unique()
+    api.register(u, "OldPass 1")
+    token = api.token_for(u, "OldPass 1")
+
+    def do_login():
+        return api.login(u, "OldPass 1")
+
+    def do_change():
+        return _change(api, token, "OldPass 1", "NewPass 2")
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        change_f = pool.submit(do_change)
+        login_fs = [pool.submit(do_login) for _ in range(4)]
+        change_r = change_f.result()
+        login_rs = [f.result() for f in login_fs]
+
+    assert change_r.status_code == 200
+    for r in login_rs:
+        if r.status_code == 200:
+            # The session was established before the change committed, so
+            # the change must have revoked it: the token is dead on use.
+            check = api.request("GET", "/orgs", token=r.json()["token"])
+            assert check.status_code == 401
+            assert check.json()["error"]["code"] == "unauthorized"
+        else:
+            # The change was already in effect: uniform wrong-password 401.
+            assert r.status_code == 401
+            assert r.json()["error"]["code"] == "invalid_credentials"
+            assert "token" not in r.json()
+
+    # No old-password session survives; the new password works normally.
+    assert api.login(u, "OldPass 1").status_code == 401
+    new_token = api.token_for(u, "NewPass 2")
+    assert api.request("GET", "/orgs", token=new_token).status_code == 200
+
+
 def test_concurrent_changes_exactly_one_wins(api: Api):
     u = api.unique()
     api.register(u)

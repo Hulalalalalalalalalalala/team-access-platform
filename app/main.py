@@ -169,6 +169,25 @@ def login(body: LoginRequest, conn: sqlite3.Connection = Depends(get_conn)) -> d
         raise ApiError(401, "invalid_credentials", "invalid username or password")
     raw_token = generate_session_token()
     with transaction(conn):
+        # Re-read the password hash INSIDE the write transaction. BEGIN
+        # IMMEDIATE serializes this login against a concurrent
+        # POST /auth/password change, so exactly one of them commits first:
+        # * the password change committed first -> the stored hash no longer
+        #   matches the one just verified, and this login fails closed with
+        #   the same 401 as a wrong password instead of issuing a session
+        #   that would bypass the change;
+        # * this login commits first -> the password change's own
+        #   transaction revokes every live session of the account, the one
+        #   created here included, so the returned token is dead on its next
+        #   use.
+        # Either way an old-password login can never leave a usable session
+        # behind once the change has taken effect. (Hashes are salted, so
+        # any password change also changes the stored string.)
+        fresh = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (user_row["id"],)
+        ).fetchone()
+        if fresh is None or fresh["password_hash"] != user_row["password_hash"]:
+            raise ApiError(401, "invalid_credentials", "invalid username or password")
         conn.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, revoked_at)"
             " VALUES (?, ?, ?, ?, NULL)",
