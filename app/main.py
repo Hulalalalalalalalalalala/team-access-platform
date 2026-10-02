@@ -14,6 +14,7 @@ Organizations
   GET  /orgs/{org_id}/members/me              own membership state
   PATCH /orgs/{org_id}/members/batch          batch role/status change [idempotent]
   PATCH /orgs/{org_id}/members/{user_id}      role/status change   [idempotent]
+  DELETE /orgs/{org_id}/members/{user_id}     remove a member      [idempotent]
 
 Invitations
   POST /orgs/{org_id}/invites         admin issues single-use invite [idempotent]
@@ -584,6 +585,99 @@ def _invalidate_delegations_for_batch(
         )
 
 
+def _invalidate_delegations_for_member_removal(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    target_user_id: int,
+    actor_id: int,
+    ts: int,
+) -> list[dict[str, Any]]:
+    """Invalidate active delegations affected by a member removal.
+
+    Runs in the SAME transaction as the membership deletion, so the removal
+    and every invalidation row commit or roll back together. Removal always
+    loses eligibility (the membership row is gone): a grantor removal yields
+    ``grantor_not_admin``, a delegate removal yields ``delegate_ineligible``,
+    and one delegation whose grantor AND delegate are both removed carries
+    BOTH reasons on a single row. Invalidation is permanent: a later rejoin
+    never revives anything. Returns a summary for the member.removed audit.
+    """
+    rows = c.execute(
+        """
+        SELECT d.id, d.grantor_id, d.delegate_id
+        FROM delegations d
+        WHERE d.org_id = ? AND d.status = 'active'
+          AND (d.grantor_id = ? OR d.delegate_id = ?)
+        """,
+        (org_id, target_user_id, target_user_id),
+    ).fetchall()
+    invalidated: list[dict[str, Any]] = []
+    for r in rows:
+        reasons: list[str] = []
+        if r["grantor_id"] == target_user_id:
+            reasons.append("grantor_not_admin")
+        if r["delegate_id"] == target_user_id:
+            reasons.append("delegate_ineligible")
+        reason = ",".join(reasons)
+        c.execute(
+            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
+            " WHERE id = ?",
+            (reason, ts, r["id"]),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
+            target_type="delegation", target_id=r["id"],
+            before={"status": "active"},
+            after={"status": "invalidated", "reason": reason,
+                   "triggered_by": target_user_id}, ts=ts,
+        )
+        invalidated.append({"id": r["id"], "reason": reason})
+    return invalidated
+
+
+def _revoke_invites_for_member_removal(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    target_username: str,
+    actor_id: int,
+    ts: int,
+) -> list[dict[str, Any]]:
+    """Revoke still-usable invites bound to the removed member's username.
+
+    Only invites issued in THIS org, bound to the target's username, still
+    ``available`` and unexpired are revoked; accepting one afterwards is
+    ``409 invite_unavailable`` (the availability check still runs first).
+    Invites the target issued for OTHER users keep their original rules and
+    are untouched. Runs in the SAME transaction. Returns a summary for the
+    member.removed audit.
+    """
+    rows = c.execute(
+        """
+        SELECT id FROM invites
+        WHERE org_id = ? AND invite_username = ? AND status = 'available'
+          AND expires_at > ?
+        """,
+        (org_id, target_username, ts),
+    ).fetchall()
+    revoked: list[dict[str, Any]] = []
+    for r in rows:
+        c.execute(
+            "UPDATE invites SET status = 'revoked', revoked_at = ? WHERE id = ?",
+            (ts, r["id"]),
+        )
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="invite.revoked",
+            target_type="invite", target_id=r["id"],
+            before={"id": r["id"], "status": "available"},
+            after={"id": r["id"], "status": "revoked", "reason": "member_removed"},
+            ts=ts,
+        )
+        revoked.append({"id": r["id"]})
+    return revoked
+
+
 @app.post("/orgs/{org_id}/delegations", status_code=201)
 def create_delegation(
     org_id: int,
@@ -1126,6 +1220,99 @@ def update_member(
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
+        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        perform=_perform,
+    )
+    return resp
+
+
+@app.delete("/orgs/{org_id}/members/{target_user_id}")
+def remove_member(
+    org_id: int,
+    target_user_id: int,
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+) -> dict[str, Any]:
+    """Remove a member from the organization.
+
+    Only active admins may call (including removing themselves). Active and
+    disabled members alike can be removed; the last active admin is protected
+    by ``409 last_admin_required``. The target is identified in the URL rather
+    than a request body, so the idempotency fingerprint covers the target user
+    id to make same-key-different-target conflicts detectable.
+    """
+    fingerprint_input = json.dumps(
+        {"user_id": target_user_id}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
+        m = c.execute(
+            """
+            SELECT m.*, u.username FROM memberships m JOIN users u ON u.id = m.user_id
+            WHERE m.org_id = ? AND m.user_id = ?
+            """,
+            (org_id, target_user_id),
+        ).fetchone()
+        if m is None:
+            # Target is not a member of THIS org (unknown user, or a member
+            # of another org): uniform 404, revealing nothing about others.
+            raise not_found("member_not_found", "member not found")
+
+        # Last-active-admin invariant (self-removal included). Disabled members
+        # never count, so removing a disabled admin/member is always allowed.
+        if m["role"] == "admin" and m["status"] == "active":
+            other_active_admins = c.execute(
+                "SELECT COUNT(*) AS n FROM memberships"
+                " WHERE org_id = ? AND role = 'admin' AND status = 'active'"
+                " AND user_id != ?",
+                (org_id, target_user_id),
+            ).fetchone()["n"]
+            if other_active_admins == 0:
+                raise conflict(
+                    "last_admin_required",
+                    "organization must retain at least one active administrator",
+                )
+
+        before = {"role": m["role"], "status": m["status"]}
+
+        # Delete the membership row: the target leaves the roster and their
+        # own org list, and every session of theirs is denied this org from
+        # the next request on. Account, sessions and other orgs are untouched.
+        c.execute(
+            "DELETE FROM memberships WHERE org_id = ? AND user_id = ?",
+            (org_id, target_user_id),
+        )
+
+        # Bound invites and affected delegations are revoked/invalidated in
+        # the SAME transaction; everything commits or rolls back together.
+        revoked_invites = _revoke_invites_for_member_removal(
+            c, org_id=org_id, target_username=m["username"],
+            actor_id=user.id, ts=ts,
+        )
+        invalidated_delegations = _invalidate_delegations_for_member_removal(
+            c, org_id=org_id, target_user_id=target_user_id,
+            actor_id=user.id, ts=ts,
+        )
+
+        add_audit(
+            c, org_id=org_id, actor_id=user.id, action="member.removed",
+            target_type="membership", target_id=f"{org_id}:{target_user_id}",
+            before=before,
+            after={
+                "org_id": org_id,
+                "user_id": target_user_id,
+                "removed": True,
+                "revoked_invites": revoked_invites,
+                "invalidated_delegations": invalidated_delegations,
+            },
+            ts=ts,
+        )
+        return 200, {"org_id": org_id, "user_id": target_user_id, "removed": True}
+
+    _, resp = _run_idempotent(
+        conn, user, idempotency.scope_member_remove(org_id), idempotency_key,
+        fingerprint_input,
         check_perm=lambda c: require_membership(c, user, org_id, admin=True),
         perform=_perform,
     )

@@ -40,6 +40,12 @@ def scope_member_update(org_id: int) -> str:
     return f"org:{org_id}:member.update"
 
 
+def scope_member_remove(org_id: int) -> str:
+    # Distinct from the role/status update and batch scopes so a removal key
+    # never consumes (or is consumed by) the other member-entry-point keys.
+    return f"org:{org_id}:member.remove"
+
+
 def scope_member_batch_update(org_id: int) -> str:
     # Distinct from the single-member scope so the two entry points never
     # consume each other's keys.
