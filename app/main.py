@@ -24,6 +24,8 @@ Invitations
 
 Audit
   GET /orgs/{org_id}/audit?page=&page_size=   admins only, paged read-only
+  GET /orgs/{org_id}/audit/scan?cursor=&page_size=
+        admins only, snapshot-consistent cursor scan (read-only)
 """
 from __future__ import annotations
 
@@ -60,6 +62,7 @@ from .schemas import (
     RevokeInviteRequest,
     UpdateMemberRequest,
 )
+from .secret import sign_text, verify_signed_text
 from .security import (
     generate_batch_id,
     generate_invite_token,
@@ -1384,6 +1387,23 @@ def remove_member(
 
 # ===================================================================== audit
 
+def _audit_item(r: sqlite3.Row) -> dict[str, Any]:
+    """Public shape of one audit entry (shared by both read endpoints)."""
+    return {
+        "id": r["id"],
+        "org_id": r["org_id"],
+        "created_at": r["created_at"],
+        "actor_id": r["actor_id"],
+        "actor_username": r["actor_username"],
+        "action": r["action"],
+        "target_type": r["target_type"],
+        "target_id": r["target_id"],
+        "before": json.loads(r["before_state"]) if r["before_state"] else None,
+        "after": json.loads(r["after_state"]) if r["after_state"] else None,
+        "batch_id": r["batch_id"],
+    }
+
+
 @app.get("/orgs/{org_id}/audit")
 def list_audit(
     org_id: int,
@@ -1408,20 +1428,116 @@ def list_audit(
         """,
         (org_id, page_size, (page - 1) * page_size),
     ).fetchall()
-    items = [
-        {
-            "id": r["id"],
-            "org_id": r["org_id"],
-            "created_at": r["created_at"],
-            "actor_id": r["actor_id"],
-            "actor_username": r["actor_username"],
-            "action": r["action"],
-            "target_type": r["target_type"],
-            "target_id": r["target_id"],
-            "before": json.loads(r["before_state"]) if r["before_state"] else None,
-            "after": json.loads(r["after_state"]) if r["after_state"] else None,
-            "batch_id": r["batch_id"],
-        }
-        for r in rows
-    ]
+    items = [_audit_item(r) for r in rows]
     return {"page": page, "page_size": page_size, "total": total, "items": items}
+
+
+# ------------------------------------------------------------- audit scan
+
+_CURSOR_VERSION = 1
+
+
+def _encode_scan_cursor(org_id: int, end_id: int, position: int) -> str:
+    """Opaque continuation token for an audit scan.
+
+    The cursor only carries a read position: the organization, the scan's
+    fixed upper id bound (the snapshot end) and the id of the last entry
+    already returned. It is HMAC-signed with the server key, so clients can
+    neither read nor alter it, and deterministic, so re-issuing a cursor for
+    an unchanged position yields the identical string. It never substitutes
+    for authentication — every batch re-checks the caller's current admin
+    membership.
+    """
+    payload = json.dumps(
+        {"v": _CURSOR_VERSION, "org": org_id, "end": end_id, "pos": position},
+        separators=(",", ":"),
+    )
+    return sign_text(payload)
+
+
+def _decode_scan_cursor(cursor: str, org_id: int) -> tuple[int, int]:
+    """Validate a cursor for THIS organization, returning (end_id, position).
+
+    Anything unrecognized, tampered with, or minted for another organization
+    is the same 422 invalid_cursor and reveals no audit content.
+    """
+    try:
+        payload = json.loads(verify_signed_text(cursor))
+        end_id = payload["end"]
+        position = payload["pos"]
+        if (
+            payload["v"] != _CURSOR_VERSION
+            or payload["org"] != org_id
+            or not isinstance(end_id, int)
+            or not isinstance(position, int)
+            or isinstance(end_id, bool)
+            or isinstance(position, bool)
+            or end_id < 0
+            or position < 0
+            or position > end_id
+        ):
+            raise ValueError
+    except Exception:
+        raise ApiError(422, "invalid_cursor", "cursor is invalid")
+    return end_id, position
+
+
+@app.get("/orgs/{org_id}/audit/scan")
+def scan_audit(
+    org_id: int,
+    cursor: Optional[str] = Query(default=None),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user: CurrentUser = Depends(current_user),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Snapshot-consistent cursor scan of the organization's audit trail.
+
+    The first request (no ``cursor``) fixes the range as every entry of this
+    organization committed at that instant: audit ids are monotonic, so the
+    range is exactly ``id <= end_id`` and entries written later — even with
+    an identical timestamp — can never join it. Follow-up requests pass the
+    returned ``next_cursor`` and read strictly after the previous batch's
+    last id, so every in-range entry appears exactly once regardless of how
+    ``page_size`` changes between batches. The cursor is stateless: repeating
+    a request with the same cursor returns the same batch and does not
+    consume progress. Authorization is re-checked on every batch against the
+    caller's CURRENT membership.
+    """
+    require_membership(conn, user, org_id, admin=True)
+    if cursor is None:
+        # Fix the snapshot range [.., end_id] for this organization only;
+        # rows committed by other orgs interleave in id space but are
+        # filtered out without affecting order or completeness.
+        snap = conn.execute(
+            "SELECT MAX(id) AS end_id, COUNT(*) AS n FROM audit_logs WHERE org_id = ?",
+            (org_id,),
+        ).fetchone()
+        end_id = snap["end_id"] or 0
+        total = snap["n"]
+        position = 0
+    else:
+        end_id, position = _decode_scan_cursor(cursor, org_id)
+        # Audit rows are never updated or deleted, so the in-range total is
+        # identical for every batch of the scan.
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM audit_logs WHERE org_id = ? AND id <= ?",
+            (org_id, end_id),
+        ).fetchone()["n"]
+    # Fetch one extra row to learn whether a further batch exists; this ends
+    # the scan with next_cursor = null exactly when the final batch is full.
+    rows = conn.execute(
+        """
+        SELECT a.*, u.username AS actor_username
+        FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+        WHERE a.org_id = ? AND a.id > ? AND a.id <= ?
+        ORDER BY a.id ASC
+        LIMIT ?
+        """,
+        (org_id, position, end_id, page_size + 1),
+    ).fetchall()
+    has_more = len(rows) > page_size
+    items = [_audit_item(r) for r in rows[:page_size]]
+    next_cursor = (
+        _encode_scan_cursor(org_id, end_id, items[-1]["id"]) if has_more else None
+    )
+    return {"items": items, "total": total, "next_cursor": next_cursor}
