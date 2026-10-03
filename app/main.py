@@ -244,8 +244,15 @@ def logout_others(
     token = _extract_token(authorization, x_session_token)
     if not token:
         raise unauthorized()
-    ts = now_ts()
     with transaction(conn):
+        # The timestamp is taken INSIDE the transaction, i.e. only after
+        # BEGIN IMMEDIATE has acquired the write lock: authorization and the
+        # revoked_sessions count must reflect the session state at the moment
+        # the operation actually executes, not when the request arrived. A
+        # session that was still valid on arrival but reaches its expiry
+        # instant (expires_at <= now) while queued behind other writers is
+        # rejected with 401 and revokes nothing.
+        ts = now_ts()
         # The session is (re-)validated INSIDE the write transaction.
         # BEGIN IMMEDIATE serializes concurrent logout-others requests (and
         # password changes) for the same account, so a second in-flight
