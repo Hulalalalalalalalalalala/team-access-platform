@@ -1272,6 +1272,44 @@ def update_member(
     if body.role is None and body.status is None:
         raise ApiError(422, "validation_error", "role or status is required")
 
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``current_user`` already applied the existing
+    # precedence and proved it valid when the request arrived). That arrival
+    # check alone is not enough: the request may then wait behind the write
+    # lock, and the session can be logged out, revoked by logout-others or a
+    # password change, or reach its expiry while waiting. The adjustment must
+    # be authorized by the session state when it actually takes effect, so
+    # the SAME session is re-validated INSIDE the write transaction (see
+    # ``_check_perm``).
+    request_token = user.token
+
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this adjustment against the logout /
+        # logout-others / password-change transactions (all writers): once
+        # this check reads the session as live and the transaction goes on to
+        # change the member, no revocation can commit in between; and if a
+        # revocation committed first — or the expiry instant arrived
+        # (expires_at <= now) while the request was waiting — the adjustment
+        # fails closed with 401. Another still-valid session of the same
+        # account cannot rescue this one: authorization is keyed to this
+        # token hash alone. Conversely, revoking only the account's OTHER
+        # sessions leaves this one live and the adjustment proceeds.
+        #
+        # This runs ahead of the membership check (403), the target lookup
+        # (404), the last-admin invariant (409) and the idempotency lookup
+        # (409 / stored replay), so an invalid session is always answered 401
+        # first; and it runs before anything is written, so a 401 here keeps
+        # the target's role/status/updated_at untouched, invalidates no
+        # delegation and stores no idempotency record — on first attempts
+        # (keyed or not) and on replays of a stored success alike
+        # (``_run_idempotent`` calls ``check_perm`` on every path before any
+        # replay is returned, and a rejected replay never rewrites the stored
+        # success).
+        revalidate_session(c, request_token, now_ts())
+        require_membership(c, user, org_id, admin=True)
+
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         m = c.execute(
             """
@@ -1341,7 +1379,7 @@ def update_member(
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        check_perm=_check_perm,
         perform=_perform,
     )
     return resp
