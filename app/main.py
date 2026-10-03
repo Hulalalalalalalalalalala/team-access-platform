@@ -652,72 +652,33 @@ def _sweep_delegations(c: sqlite3.Connection, org_id: int, ts: int) -> None:
         )
 
 
-def _invalidate_delegations_for_member_change(
-    c: sqlite3.Connection,
-    *,
-    org_id: int,
-    target_user_id: int,
-    new_role: str,
-    new_status: str,
-    actor_id: int,
-    ts: int,
-) -> None:
-    """Invalidate active delegations affected by a member role/status change.
-
-    Runs in the SAME transaction as the member change, so the change and the
-    invalidation audit rows commit atomically. Invalidation is permanent:
-    later restoring the role/status does not revive anything.
-    """
-    rows = c.execute(
-        """
-        SELECT d.id, d.grantor_id, d.delegate_id
-        FROM delegations d
-        WHERE d.org_id = ? AND d.status = 'active'
-          AND (d.grantor_id = ? OR d.delegate_id = ?)
-        """,
-        (org_id, target_user_id, target_user_id),
-    ).fetchall()
-    for r in rows:
-        reasons: list[str] = []
-        if r["grantor_id"] == target_user_id and (new_role != "admin" or new_status != "active"):
-            reasons.append("grantor_not_admin")
-        if r["delegate_id"] == target_user_id and (new_role != "member" or new_status != "active"):
-            reasons.append("delegate_ineligible")
-        if not reasons:
-            continue
-        reason = ",".join(reasons)
-        c.execute(
-            "UPDATE delegations SET status = 'invalidated', invalid_reason = ?, invalidated_at = ?"
-            " WHERE id = ?",
-            (reason, ts, r["id"]),
-        )
-        add_audit(
-            c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
-            target_type="delegation", target_id=r["id"],
-            before={"status": "active"},
-            after={"status": "invalidated", "reason": reason,
-                   "triggered_by": target_user_id}, ts=ts,
-        )
-
-
-def _invalidate_delegations_for_batch(
+def _invalidate_delegations_for_changes(
     c: sqlite3.Connection,
     *,
     org_id: int,
     new_states: dict[int, tuple[str, str]],
     actor_id: int,
-    batch_id: str,
     ts: int,
+    batch_id: Optional[str] = None,
 ) -> None:
-    """Invalidate active delegations affected by a batch member change.
+    """Invalidate active delegations whose grantor or delegate lost eligibility.
 
-    ``new_states`` maps user_id -> (new_role, new_status) for members that
-    actually changed. Commits in the SAME transaction as the batch, so the
-    member changes and every invalidation row live or die together. When one
-    delegation's grantor AND delegate both lose eligibility in the same
-    batch, exactly ONE invalidation row is written carrying BOTH reasons.
-    Invalidation is permanent: restoring members in a later batch never
-    revives anything.
+    Shared core for the single-member and batch member adjustments.
+    ``new_states`` maps user_id -> (new_role, new_status) for the members that
+    ACTUALLY changed in this operation; delegations involving anyone else are
+    untouched. A delegation is permanently ``invalidated`` when its grantor is
+    no longer an active administrator (``grantor_not_admin``) or its delegate
+    is no longer an active ordinary member (``delegate_ineligible``); later
+    restoring a member never revives it. When both parties lose eligibility in
+    the same operation, exactly ONE invalidation row is written carrying BOTH
+    reasons, grantor first.
+
+    Runs in the SAME transaction as the member change(s), so the changes and
+    the invalidation audit rows commit or roll back together. The audit
+    ``triggered_by`` names the member(s) whose change actually caused the
+    invalidation, in grantor-then-delegate order without duplicates: a single
+    member id for a single-member adjustment, the list of ids for a batch
+    (whose rows also carry ``batch_id``).
     """
     if not new_states:
         return
@@ -733,16 +694,14 @@ def _invalidate_delegations_for_batch(
         reasons: list[str] = []
         triggered: list[int] = []
         g_state = new_states.get(r["grantor_id"])
-        if g_state is not None:
-            if g_state[0] != "admin" or g_state[1] != "active":
-                reasons.append("grantor_not_admin")
-                triggered.append(r["grantor_id"])
+        if g_state is not None and (g_state[0] != "admin" or g_state[1] != "active"):
+            reasons.append("grantor_not_admin")
+            triggered.append(r["grantor_id"])
         d_state = new_states.get(r["delegate_id"])
-        if d_state is not None:
-            if d_state[0] != "member" or d_state[1] != "active":
-                reasons.append("delegate_ineligible")
-                if r["delegate_id"] not in triggered:
-                    triggered.append(r["delegate_id"])
+        if d_state is not None and (d_state[0] != "member" or d_state[1] != "active"):
+            reasons.append("delegate_ineligible")
+            if r["delegate_id"] not in triggered:
+                triggered.append(r["delegate_id"])
         if not reasons:
             continue
         reason = ",".join(reasons)
@@ -756,9 +715,51 @@ def _invalidate_delegations_for_batch(
             target_type="delegation", target_id=r["id"],
             before={"status": "active"},
             after={"status": "invalidated", "reason": reason,
-                   "triggered_by": triggered},
+                   "triggered_by": triggered if batch_id is not None else triggered[0]},
             batch_id=batch_id, ts=ts,
         )
+
+
+def _invalidate_delegations_for_member_change(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    target_user_id: int,
+    new_role: str,
+    new_status: str,
+    actor_id: int,
+    ts: int,
+) -> None:
+    """Single-member adjustment entry; see ``_invalidate_delegations_for_changes``.
+
+    The audit ``triggered_by`` is the single adjusted member's id and the row
+    carries no ``batch_id``.
+    """
+    _invalidate_delegations_for_changes(
+        c, org_id=org_id, new_states={target_user_id: (new_role, new_status)},
+        actor_id=actor_id, ts=ts,
+    )
+
+
+def _invalidate_delegations_for_batch(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    new_states: dict[int, tuple[str, str]],
+    actor_id: int,
+    batch_id: str,
+    ts: int,
+) -> None:
+    """Batch adjustment entry; see ``_invalidate_delegations_for_changes``.
+
+    The audit ``triggered_by`` lists every member whose change actually caused
+    the invalidation (grantor before delegate, no duplicates) and the row
+    carries this batch's ``batch_id``.
+    """
+    _invalidate_delegations_for_changes(
+        c, org_id=org_id, new_states=new_states,
+        actor_id=actor_id, ts=ts, batch_id=batch_id,
+    )
 
 
 @app.post("/orgs/{org_id}/delegations", status_code=201)
