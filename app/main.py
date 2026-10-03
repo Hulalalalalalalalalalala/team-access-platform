@@ -1268,9 +1268,20 @@ def update_member(
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> dict[str, Any]:
     if body.role is None and body.status is None:
         raise ApiError(422, "validation_error", "role or status is required")
+
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``_extract_token`` keeps the existing precedence).
+    # ``current_user`` only proves it was valid when the request arrived; the
+    # adjustment — and any idempotent replay — must be authorized by the
+    # session state at the moment it runs inside the write transaction.
+    request_token = _extract_token(authorization, x_session_token)
+    if not request_token:  # defense in depth; current_user already 401s here
+        raise unauthorized()
 
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         m = c.execute(
@@ -1339,9 +1350,37 @@ def update_member(
         ).fetchone()
         return 200, {"membership": membership_dict(row)}
 
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this adjustment against the logout /
+        # logout-others / password-change transactions (all writers): once
+        # this check reads the session as live and the transaction goes on
+        # to change the member, no revocation can commit in between; and if
+        # a revocation committed first — this session logged out, revoked by
+        # "logout other sessions" or a password change, or the expiry
+        # instant arrived (expires_at <= now) while the request was waiting
+        # — the adjustment fails closed with 401. Another still-valid
+        # session of the same account cannot rescue this one: authorization
+        # is keyed to this token hash alone. Conversely, revoking only the
+        # account's OTHER sessions leaves this one live and the adjustment
+        # proceeds.
+        #
+        # This runs ahead of the enabled-admin membership check (403), the
+        # target lookup (404), the last-admin invariant (409) and the
+        # idempotency lookup/replay (409), so an invalid session is always
+        # answered 401 first; and it runs before anything is written, so a
+        # 401 here changes no role/status/updated_at, invalidates no
+        # delegation, writes no member/delegation audit and stores no
+        # idempotency record — on first attempts and on replays of a stored
+        # success alike (``_run_idempotent`` calls ``check_perm`` on every
+        # path, before any replay is returned).
+        revalidate_session(c, request_token, now_ts())
+        require_membership(c, user, org_id, admin=True)
+
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        check_perm=_check_perm,
         perform=_perform,
     )
     return resp
