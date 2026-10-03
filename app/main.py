@@ -244,15 +244,21 @@ def logout_others(
     token = _extract_token(authorization, x_session_token)
     if not token:
         raise unauthorized()
-    ts = now_ts()
     with transaction(conn):
-        # The session is (re-)validated INSIDE the write transaction.
-        # BEGIN IMMEDIATE serializes concurrent logout-others requests (and
-        # password changes) for the same account, so a second in-flight
-        # request observes the revocation committed by the winner and fails closed
-        # with 401 — exactly one concurrent attempt can succeed, and a
-        # session that was logged out, revoked or expired after the request
-        # started cannot go on to revoke the others.
+        # The timestamp is taken INSIDE the transaction, i.e. after the
+        # BEGIN IMMEDIATE write lock is acquired: authorization and the
+        # revoked-count are judged by the session state at the moment the
+        # operation actually executes, not when the request arrived. A
+        # session that reaches its expiry instant (expires_at <= now) while
+        # the request waited on the lock — or was logged out / revoked in
+        # the meantime — fails closed with 401 and revokes nothing; another
+        # still-valid session of the same account can never substitute (the
+        # lookup is keyed to this token hash alone). BEGIN IMMEDIATE also
+        # serializes concurrent logout-others requests (and password
+        # changes) for the same account, so a second in-flight request
+        # observes the revocation committed by the winner and fails closed
+        # with 401 — exactly one concurrent attempt can succeed.
+        ts = now_ts()
         row = conn.execute(
             """
             SELECT s.id AS session_id, s.expires_at, s.revoked_at,
