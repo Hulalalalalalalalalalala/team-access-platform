@@ -419,6 +419,49 @@ def create_org(
     conn: sqlite3.Connection = Depends(get_conn),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
 ) -> dict[str, Any]:
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``current_user`` already applied the existing
+    # precedence and proved it valid when the request arrived). That arrival
+    # check alone is not enough: the request may then wait behind the write
+    # lock, and the session can be logged out, revoked by logout-others or a
+    # password change, or reach its expiry while waiting. Organization
+    # creation must be authorized by the session state when the creation
+    # actually takes effect, so the SAME session is re-validated INSIDE the
+    # write transaction (see ``_check_perm``).
+    request_token = user.token
+
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before anything else. BEGIN IMMEDIATE
+        # serializes this creation against the logout / logout-others /
+        # password-change transactions (all writers): once this check reads
+        # the session as live and the transaction goes on to insert the org,
+        # no revocation can commit in between; and if a revocation committed
+        # first — or the expiry instant arrived (expires_at <= now) while the
+        # request was waiting — the creation fails closed with 401. Another
+        # still-valid session of the same account cannot rescue this one:
+        # authorization is keyed to this token hash alone. Conversely,
+        # revoking only the account's OTHER sessions leaves this one live and
+        # the creation proceeds. Creating an org requires only a valid login,
+        # so there is no membership/admin precondition beyond the session
+        # check.
+        #
+        # ``_run_idempotent`` invokes this on EVERY path — first attempt,
+        # stored-success replay and the concurrent-key retry — before the
+        # idempotency row is read, so a session that has since died gets 401
+        # even when its key already stores a successful result; and because
+        # the 401 runs ahead of both the name check and the request-fingerprint
+        # comparison, it wins over org_name_taken / idempotency_conflict and
+        # never stores (or overwrites) an idempotency record: a key not yet
+        # consumed by a success stays free for reuse after a fresh login.
+        ts = now_ts()
+        sess = c.execute(
+            "SELECT revoked_at, expires_at FROM sessions WHERE token_hash = ?",
+            (hash_token(request_token),),
+        ).fetchone()
+        if sess is None or sess["revoked_at"] is not None or sess["expires_at"] <= ts:
+            raise unauthorized("invalid or expired session")
+
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         if c.execute("SELECT 1 FROM organizations WHERE name = ?", (body.name,)).fetchone():
             raise conflict("org_name_taken", "organization name is already taken")
@@ -445,7 +488,7 @@ def create_org(
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_org_create(), idempotency_key, request_body,
-        check_perm=lambda c: None, perform=_perform,
+        check_perm=_check_perm, perform=_perform,
     )
     return resp
 
