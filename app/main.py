@@ -1020,11 +1020,49 @@ def accept_invite(
     body: AcceptInviteRequest,
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> dict[str, Any]:
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``_extract_token`` keeps the existing precedence).
+    # ``current_user`` only proves it was valid when the request arrived;
+    # authorization must hold when the join takes effect below.
+    request_token = _extract_token(authorization, x_session_token)
+    if not request_token:  # defense in depth; current_user already 401s here
+        raise unauthorized()
+
     # Strict check order per spec:
+    # 0) the carried session is still live AT JOIN TIME (re-checked inside
+    #    the write transaction)
     # 1) invite availability  2) username match  3) membership state
     with transaction(conn):
         ts = now_ts()
+        # Re-validate the EXACT session carried by this request, INSIDE the
+        # IMMEDIATE write transaction. BEGIN IMMEDIATE serializes this accept
+        # against the logout / logout-others / password-change transactions
+        # (all writers). Once this check reads the session as live and the
+        # transaction goes on to claim the invite, no revocation can be
+        # committed in between; and if a revocation committed first — this
+        # session logged out, all sessions revoked by a password change, or
+        # the expiry instant arrived (expires_at <= now) while the request
+        # was waiting — the join fails closed with 401. Another valid login
+        # of the same account cannot rescue this session: authorization is
+        # keyed to this token hash alone. Nothing is written on this path,
+        # so the invite stays available and reusable after a fresh login.
+        sess = conn.execute(
+            """
+            SELECT s.id, s.expires_at, s.revoked_at,
+                   u.id AS user_id, u.username AS username
+            FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (hash_token(request_token),),
+        ).fetchone()
+        if sess is None or sess["revoked_at"] is not None or sess["expires_at"] <= ts:
+            raise unauthorized("invalid or expired session")
+        actor_id = sess["user_id"]
+        actor_username = sess["username"]
+
         inv = conn.execute(
             "SELECT * FROM invites WHERE token_hash = ?",
             (hash_token(body.token),),
@@ -1034,11 +1072,11 @@ def accept_invite(
         if inv["status"] != "available" or inv["expires_at"] <= ts:
             # expired / revoked / already used all share this code
             raise conflict("invite_unavailable", "invite is not available")
-        if inv["invite_username"] != user.username:
+        if inv["invite_username"] != actor_username:
             raise ApiError(403, "username_mismatch", "invite is bound to another user")
         existing = conn.execute(
             "SELECT * FROM memberships WHERE org_id = ? AND user_id = ?",
-            (inv["org_id"], user.id),
+            (inv["org_id"], actor_id),
         ).fetchone()
         if existing is not None:
             # Existing membership (any role/status) is never overwritten.
@@ -1048,7 +1086,7 @@ def accept_invite(
         cur = conn.execute(
             "UPDATE invites SET status = 'used', used_at = ?, used_by = ?"
             " WHERE id = ? AND status = 'available' AND ? < expires_at",
-            (ts, user.id, inv["id"], ts),
+            (ts, actor_id, inv["id"], ts),
         )
         if cur.rowcount == 0:
             raise conflict("invite_unavailable", "invite is not available")
@@ -1056,13 +1094,13 @@ def accept_invite(
         conn.execute(
             "INSERT INTO memberships (org_id, user_id, role, status, created_at, updated_at)"
             " VALUES (?, ?, ?, 'active', ?, ?)",
-            (inv["org_id"], user.id, inv["role"], ts, ts),
+            (inv["org_id"], actor_id, inv["role"], ts, ts),
         )
         add_audit(
-            conn, org_id=inv["org_id"], actor_id=user.id, action="invite.accepted",
-            target_type="membership", target_id=f"{inv['org_id']}:{user.id}",
+            conn, org_id=inv["org_id"], actor_id=actor_id, action="invite.accepted",
+            target_type="membership", target_id=f"{inv['org_id']}:{actor_id}",
             before=None,
-            after={"org_id": inv["org_id"], "user_id": user.id,
+            after={"org_id": inv["org_id"], "user_id": actor_id,
                    "role": inv["role"], "status": "active", "invite_id": inv["id"]},
             ts=ts,
         )
@@ -1073,7 +1111,7 @@ def accept_invite(
             FROM memberships m JOIN users u ON u.id = m.user_id
             WHERE m.org_id = ? AND m.user_id = ?
             """,
-            (inv["org_id"], user.id),
+            (inv["org_id"], actor_id),
         ).fetchone()
     return {"membership": membership_dict(m_row)}
 
