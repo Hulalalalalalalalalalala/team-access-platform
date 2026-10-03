@@ -1166,6 +1166,44 @@ def batch_update_members(
             raise ApiError(422, "validation_error", "duplicate user_id in changes")
         seen.add(ch.user_id)
 
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``current_user`` already applied the existing
+    # precedence and proved it valid when the request arrived). That arrival
+    # check alone is not enough: the request may then wait behind the write
+    # lock, and the session can be logged out, revoked by logout-others or a
+    # password change, or reach its expiry while waiting. The batch must be
+    # authorized by the session state when it actually takes effect, so the
+    # SAME session is re-validated INSIDE the write transaction (see
+    # ``_check_perm``) — exactly as the single-member endpoint does.
+    request_token = user.token
+
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this batch against the logout / logout-others /
+        # password-change transactions (all writers): once this check reads
+        # the session as live and the transaction goes on to change members,
+        # no revocation can commit in between; and if a revocation committed
+        # first — or the expiry instant arrived (expires_at <= now) while the
+        # request was waiting — the whole batch fails closed with 401.
+        # Another still-valid session of the same account cannot rescue this
+        # one: authorization is keyed to this token hash alone. Conversely,
+        # revoking only the account's OTHER sessions leaves this one live and
+        # the batch proceeds.
+        #
+        # This runs ahead of the membership check (403), the target lookups
+        # (404), the last-admin invariant (409) and the idempotency lookup
+        # (409 / stored replay), so an invalid session is always answered 401
+        # first; and it runs before anything is written, so a 401 here
+        # changes no member's role/status/updated_at, invalidates no
+        # delegation, writes no audit row and stores no idempotency record —
+        # on first attempts (keyed or not) and on replays of a stored success
+        # alike (``_run_idempotent`` calls ``check_perm`` on every path before
+        # any replay is returned, and a rejected replay never rewrites the
+        # stored success).
+        revalidate_session(c, request_token, now_ts())
+        require_membership(c, user, org_id, admin=True)
+
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         # Load every target first; a target outside THIS organization fails
         # the whole batch with 404 and reveals nothing about other orgs.
@@ -1253,7 +1291,7 @@ def batch_update_members(
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_batch_update(org_id),
         idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        check_perm=_check_perm,
         perform=_perform,
     )
     return resp
