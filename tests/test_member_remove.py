@@ -26,6 +26,7 @@ Removal (unlike disable/enable) deletes the membership. These tests cover:
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
@@ -786,6 +787,179 @@ def test_failed_delegation_audit_rolls_back_removal(api: Api, db):
         (org["id"], tid)).fetchone()["status"] == "active"
 
     assert _remove(api, admin, org["id"], tid).status_code == 200
+
+
+# ============================================ session validity at commit time
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _revoke_session(db, token: str) -> None:
+    db.execute("UPDATE sessions SET revoked_at = 1 WHERE token_hash = ?",
+               (_token_hash(token),))
+
+
+def _blocked_delete(api: Api, db, send, mutate) -> httpx.Response:
+    """Run a DELETE ``send()`` while the database write lock is held.
+
+    The request passes its arrival-time session check and then blocks on the
+    write lock; ``mutate()`` runs under the lock and commits together with
+    the lock release, so the DELETE's in-transaction session re-check
+    observes the mutated state exactly as if the change had landed while the
+    request was waiting for its turn to execute.
+    """
+    db.execute("BEGIN IMMEDIATE")
+    out: dict[str, httpx.Response] = {}
+
+    def worker() -> None:
+        out["r"] = send()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    time.sleep(1.0)  # let the request arrive and block on the write lock
+    mutate()
+    db.commit()
+    t.join(timeout=30)
+    return out["r"]
+
+
+def test_session_revoked_while_waiting_is_401_and_removes_nothing(api: Api, db):
+    aname, admin, org = _new_org(api, "rm-wait")
+    tname, _, tid = _add_member(api, admin, org["id"])
+    pending = _issue(api, admin, org["id"], tname).json()
+    d = _grant(api, admin, org["id"], tid).json()
+    key = _key()
+
+    # The session is logged out while the DELETE waits for the write lock.
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, admin, org["id"], tid, key=key),
+                        mutate=lambda: _revoke_session(db, admin))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    # Nothing happened: no removal, no invite revocation, no delegation
+    # invalidation, no removal audit, and the key was not occupied.
+    admin2 = api.token_for(aname)  # the account itself is fine; re-login works
+    assert any(m["user_id"] == tid for m in _roster(api, admin2, org["id"]))
+    assert db.execute("SELECT status FROM invites WHERE id = ?",
+                      (pending["id"],)).fetchone()["status"] == "available"
+    assert db.execute("SELECT status FROM delegations WHERE id = ?",
+                      (d["id"],)).fetchone()["status"] == "active"
+    assert "member.removed" not in _audit_grouped(api, admin2, org["id"])
+    n = db.execute(
+        "SELECT COUNT(*) AS n FROM idempotency_keys"
+        " WHERE scope = ? AND idempotency_key = ?",
+        (f"org:{org['id']}:member.remove", key),
+    ).fetchone()["n"]
+    assert n == 0
+
+    # Re-logged-in and still an active admin: the same key now performs the
+    # removal under the normal rules.
+    r = _remove(api, admin2, org["id"], tid, key=key)
+    assert r.status_code == 200 and r.json()["removed"] is True
+    assert all(m["user_id"] != tid for m in _roster(api, admin2, org["id"]))
+
+
+def test_session_expires_while_waiting_is_401(api: Api, db):
+    aname, admin, org = _new_org(api, "rm-exp")
+    _, _, tid = _add_member(api, admin, org["id"])
+
+    # The session is still valid when the request arrives, but its expiry
+    # instant passes while the DELETE waits for the write lock.
+    db.execute("UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
+               (int(time.time()) + 2, _token_hash(admin)))
+    db.commit()
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, admin, org["id"], tid),
+                        mutate=lambda: time.sleep(3))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    admin2 = api.token_for(aname)
+    assert any(m["user_id"] == tid for m in _roster(api, admin2, org["id"]))
+
+
+def test_idempotent_replay_with_revoked_session_is_401(api: Api, db):
+    org, aname, a_token, _, _, _, b_id = _two_admins(api)
+    key = _key()
+    assert _remove(api, a_token, org["id"], b_id, key=key).status_code == 200
+
+    # A replay of the stored success whose carrying session was revoked
+    # while waiting: 401, never the historical 200.
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, a_token, org["id"], b_id, key=key),
+                        mutate=lambda: _revoke_session(db, a_token))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    # The stored record is untouched: after a fresh login the same key
+    # replays the original success and nothing is removed twice.
+    a_token2 = api.token_for(aname)
+    r = _remove(api, a_token2, org["id"], b_id, key=key)
+    assert r.status_code == 200
+    assert r.json() == {"org_id": org["id"], "user_id": b_id, "removed": True}
+    assert len(_audit_grouped(api, a_token2, org["id"])["member.removed"]) == 1
+
+
+def test_revoking_only_other_sessions_lets_removal_proceed(api: Api, db):
+    aname, s1, org = _new_org(api, "rm-others")
+    s2 = api.token_for(aname)  # a second, independent session of the same admin
+    _, _, tid = _add_member(api, s1, org["id"])
+
+    # Only the OTHER session is revoked while this request waits: this
+    # session is still live, so the removal proceeds under the normal rules.
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, s1, org["id"], tid),
+                        mutate=lambda: _revoke_session(db, s2))
+    assert r.status_code == 200 and r.json()["removed"] is True
+    assert all(m["user_id"] != tid for m in _roster(api, s1, org["id"]))
+
+
+def test_invalid_session_is_401_regardless_of_target_or_org_state(api: Api, db):
+    aname, admin, org = _new_org(api, "rm-prec")
+    me = api.request("GET", f"/orgs/{org['id']}/members/me",
+                     token=admin).json()["membership"]["user_id"]
+
+    # Target not in the organization (a live session would get 404).
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, admin, org["id"], 999999),
+                        mutate=lambda: _revoke_session(db, admin))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    # Unknown organization (a live session would get 403).
+    admin2 = api.token_for(aname)
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, admin2, 999999, me),
+                        mutate=lambda: _revoke_session(db, admin2))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    # Last active administrator self-removal (a live session would get 409).
+    admin3 = api.token_for(aname)
+    r = _blocked_delete(api, db,
+                        send=lambda: _remove(api, admin3, org["id"], me),
+                        mutate=lambda: _revoke_session(db, admin3))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    # The last admin is still in place and a fresh login works.
+    admin4 = api.token_for(aname)
+    assert api.request("GET", f"/orgs/{org['id']}/members/me",
+                       token=admin4).status_code == 200
+
+
+def test_x_session_token_header_revoked_while_waiting_is_401(api: Api, db):
+    aname, admin, org = _new_org(api, "rm-xst")
+    _, _, tid = _add_member(api, admin, org["id"])
+
+    # Same rule when the session travels in X-Session-Token instead of
+    # Authorization: Bearer.
+    r = _blocked_delete(
+        api, db,
+        send=lambda: api.request("DELETE", f"/orgs/{org['id']}/members/{tid}",
+                                 headers={"X-Session-Token": admin}),
+        mutate=lambda: _revoke_session(db, admin),
+    )
+    assert r.status_code == 401 and r.json()["error"]["code"] == "unauthorized"
+
+    admin2 = api.token_for(aname)
+    assert any(m["user_id"] == tid for m in _roster(api, admin2, org["id"]))
 
 
 # ================================================================ persistence

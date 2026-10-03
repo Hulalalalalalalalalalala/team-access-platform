@@ -1337,6 +1337,46 @@ def remove_member(
     untouched. Active admins may remove anyone — active, disabled, or
     themselves — except the organization's last active administrator.
     """
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``current_user`` already applied the existing
+    # precedence and proved it valid when the request arrived). That arrival
+    # check alone is not enough: the request may then wait behind the write
+    # lock, and the session can be logged out, revoked by logout-others or a
+    # password change, or reach its expiry while waiting. Authorization must
+    # hold when the removal takes effect, so the SAME session is re-validated
+    # INSIDE the write transaction (see ``_check_perm``).
+    request_token = user.token
+
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this removal against the logout /
+        # logout-others / password-change transactions (all writers): once
+        # this check reads the session as live and the transaction goes on
+        # to remove the member, no revocation can commit in between; and if
+        # a revocation committed first — or the expiry instant arrived
+        # (expires_at <= now) while the request was waiting — the removal
+        # fails closed with 401. Another still-valid session of the same
+        # account cannot rescue this one: authorization is keyed to this
+        # token hash alone. Conversely, revoking only the account's OTHER
+        # sessions leaves this one live and the removal proceeds.
+        #
+        # This runs ahead of the membership check (403), the target lookup
+        # (404) and the last-admin invariant (409), so an invalid session is
+        # always answered 401 first; and it runs before anything is written,
+        # so a 401 here deletes nothing, revokes no invite, invalidates no
+        # delegation and stores no idempotency record — on first attempts
+        # and on replays of a stored success alike (``_run_idempotent``
+        # calls ``check_perm`` on every path, before any replay is
+        # returned).
+        ts = now_ts()
+        sess = c.execute(
+            "SELECT revoked_at, expires_at FROM sessions WHERE token_hash = ?",
+            (hash_token(request_token),),
+        ).fetchone()
+        if sess is None or sess["revoked_at"] is not None or sess["expires_at"] <= ts:
+            raise unauthorized("invalid or expired session")
+        require_membership(c, user, org_id, admin=True)
 
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         m = c.execute(
@@ -1478,7 +1518,7 @@ def remove_member(
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_remove(org_id),
         idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        check_perm=_check_perm,
         perform=_perform, replay_check=_replay_check,
     )
     return resp
