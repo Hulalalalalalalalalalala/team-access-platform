@@ -64,6 +64,39 @@ async def current_user(user: Optional[CurrentUser] = Depends(current_user_option
     return user
 
 
+def revalidate_session(conn: sqlite3.Connection, token: str, ts: int) -> int:
+    """Re-check the EXACT session carried by a request, inside a write txn.
+
+    The ``current_user`` dependency only proves the session was live when the
+    request arrived. A mutating endpoint must instead be authorized by the
+    session state at the moment the change actually takes effect: while a
+    request is queued on the write lock its session may be logged out,
+    revoked via "logout other sessions" / a password change, or simply reach
+    its expiry instant (``expires_at <= ts`` is invalid). Any of those fails
+    closed with 401, and another still-valid session of the same account can
+    never substitute — the lookup is keyed to this token hash alone.
+
+    Callers MUST run this INSIDE a ``BEGIN IMMEDIATE`` transaction. The write
+    lock serializes this check against the logout / logout-others /
+    password-change writers: once the session is read as live here, no
+    revocation can commit before the business change in the same
+    transaction; if a revocation committed first, the request is rejected.
+    Returns the authenticated user's id.
+    """
+    row = conn.execute(
+        """
+        SELECT u.id AS user_id
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+        """,
+        (hash_token(token), ts),
+    ).fetchone()
+    if row is None:
+        # Unknown, explicitly revoked, or at/past its expiry instant.
+        raise unauthorized("invalid or expired session")
+    return row["user_id"]
+
+
 def require_membership(
     conn: sqlite3.Connection,
     user: CurrentUser,

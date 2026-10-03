@@ -42,7 +42,13 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 
 from . import config, idempotency
 from .audit import add_audit
-from .auth import CurrentUser, _extract_token, current_user, require_membership
+from .auth import (
+    CurrentUser,
+    _extract_token,
+    current_user,
+    require_membership,
+    revalidate_session,
+)
 from .db import get_conn, init_db, transaction
 from .errors import (
     ApiError,
@@ -418,7 +424,18 @@ def create_org(
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> dict[str, Any]:
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``_extract_token`` keeps the existing precedence).
+    # ``user`` only proves it was valid when the request arrived; the
+    # creation — and any idempotent replay — must be authorized by the
+    # session state at the moment it runs inside the write transaction.
+    request_token = _extract_token(authorization, x_session_token)
+    if not request_token:  # defense in depth; current_user already 401s here
+        raise unauthorized()
+
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         if c.execute("SELECT 1 FROM organizations WHERE name = ?", (body.name,)).fetchone():
             raise conflict("org_name_taken", "organization name is already taken")
@@ -443,9 +460,20 @@ def create_org(
         )
         return 201, {"id": org_id, "name": body.name, "role": "admin", "created_at": ts}
 
+    def _check_session(c: sqlite3.Connection) -> None:
+        # Re-validate INSIDE the IMMEDIATE transaction, before the name check,
+        # the idempotency lookup and any write. BEGIN IMMEDIATE serializes us
+        # against logout / logout-others / password-change writers: a session
+        # revoked or expired while the request waited on the lock fails closed
+        # with 401, leaving no organization, no admin membership, no audit and
+        # no idempotency record. Another valid session of the account cannot
+        # substitute — the check is keyed to this token alone. Runs on the
+        # first attempt, the concurrent-key replay, and stored replays alike.
+        revalidate_session(c, request_token, now_ts())
+
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_org_create(), idempotency_key, request_body,
-        check_perm=lambda c: None, perform=_perform,
+        check_perm=_check_session, perform=_perform,
     )
     return resp
 
