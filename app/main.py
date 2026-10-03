@@ -1464,6 +1464,35 @@ def remove_member(
         )
         return 200, {"org_id": org_id, "user_id": target_user_id, "removed": True}
 
+    def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session carried by this request (``user.token``
+        # is the token ``_extract_token`` selected from Authorization: Bearer /
+        # X-Session-Token at the door), INSIDE the IMMEDIATE write transaction
+        # and BEFORE any other check. ``current_user`` only proved the session
+        # was valid when the request arrived; authorization must still hold at
+        # the instant the removal can take effect. BEGIN IMMEDIATE serializes
+        # this removal against the logout / logout-others / password-change
+        # transactions (all writers): if such a revocation committed first —
+        # or the expiry instant arrived (expires_at <= now) while this request
+        # waited for the lock — the request fails closed with 401 and nothing
+        # is removed, revoked, invalidated or audited. Another live session of
+        # the same account cannot rescue this one: the check is keyed to this
+        # token hash alone. Conversely, revoking only the OTHER sessions leaves
+        # this one valid and the removal proceeds by the normal rules. The 401
+        # precedes the membership/last-admin/target checks, so session failure
+        # is reported even when the org or target is missing; and because it
+        # runs on every attempt (first request and stored-success replay
+        # alike), an idempotent retry whose session died in the meantime also
+        # gets 401 instead of the historical result — the failed attempt
+        # consumes no key and overwrites no stored record.
+        sess = c.execute(
+            "SELECT revoked_at, expires_at FROM sessions WHERE token_hash = ?",
+            (hash_token(user.token),),
+        ).fetchone()
+        if sess is None or sess["revoked_at"] is not None or sess["expires_at"] <= now_ts():
+            raise unauthorized("invalid or expired session")
+        require_membership(c, user, org_id, admin=True)
+
     def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
         # A DELETE carries no body, so the request fingerprint cannot
         # distinguish targets: a stored key replayed against a DIFFERENT
@@ -1478,7 +1507,7 @@ def remove_member(
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_remove(org_id),
         idempotency_key, request_body,
-        check_perm=lambda c: require_membership(c, user, org_id, admin=True),
+        check_perm=_check_perm,
         perform=_perform, replay_check=_replay_check,
     )
     return resp
