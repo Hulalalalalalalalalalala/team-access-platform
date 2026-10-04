@@ -15,7 +15,21 @@ The verify-digest contract under test (see README):
   the path is also bad): exit code 2, empty stdout, usage text on stderr
   mentioning the new command -- never reported as a mismatch;
 * unreadable / missing / non-regular file or digest-computation failure:
-  exit code 1, empty stdout, stderr names the path, and no success output.
+  exit code 1, empty stdout, stderr names the path, and no success output;
+* a regular file that opens fine and then fails on read() after delivering
+  part of its bytes is the same kind of failure: exit code 1, empty stdout,
+  stderr names the read failure and the path, and neither ``match`` nor
+  ``mismatch`` is printed -- even if the expected digest happens to equal
+  the digest of the bytes delivered before the error. Normal EOF (including
+  a final short read and an empty file) is not an error and still matches.
+
+The read-failure case is produced deterministically by a small LD_PRELOAD
+fault injector (tests/readfail_preload.c) that makes read() return EIO on
+one selected regular file after an exact number of bytes have been read.
+It needs no privileges, does not mutate the file, and does not depend on
+timing. Its path arrives in $SEALMARK_READFAIL_PRELOAD from CTest; the
+injector-based tests skip if it is unavailable, and fail loudly (never pass
+silently) if the fault does not actually take effect.
 
 All test content and paths are created inside a fresh temporary directory.
 The executable path comes from $SEALMARK_BIN (wired up by CTest).
@@ -33,6 +47,15 @@ from pathlib import Path
 CHUNK_SIZE = 64 * 1024
 
 SEALMARK_BIN = os.environ.get("SEALMARK_BIN")
+
+# Path to the LD_PRELOAD fault injector built by CMake (Linux only).
+READFAIL_PRELOAD = os.environ.get("SEALMARK_READFAIL_PRELOAD")
+
+requires_readfail_preload = unittest.skipUnless(
+    READFAIL_PRELOAD and Path(READFAIL_PRELOAD).is_file(),
+    "SEALMARK_READFAIL_PRELOAD is unavailable; mid-read failure cannot be "
+    "injected on this platform",
+)
 
 EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -82,6 +105,37 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
 
     def run_verify(self, path_arg, digest_arg):
         return self.run_sealmark("verify-digest", path_arg, digest_arg)
+
+    def _preload_env(self, **extra):
+        env = dict(os.environ)
+        preload = READFAIL_PRELOAD
+        if env.get("LD_PRELOAD"):
+            preload = preload + ":" + env["LD_PRELOAD"]
+        env["LD_PRELOAD"] = preload
+        env.update(extra)
+        return env
+
+    def run_verify_with_read_failure(self, path, after, digest_arg):
+        """verify-digest with the injector armed: read() on `path` fails
+        with EIO once `after` bytes have been delivered."""
+        env = self._preload_env(
+            SEALMARK_READFAIL_PATH=str(path),
+            SEALMARK_READFAIL_AFTER=str(after),
+        )
+        return subprocess.run(
+            [SEALMARK_BIN, "verify-digest", str(path), digest_arg],
+            capture_output=True,
+            env=env,
+        )
+
+    def run_verify_preloaded(self, path, digest_arg):
+        """verify-digest under the preloaded but unarmed injector, used by
+        the normal-EOF control tests."""
+        return subprocess.run(
+            [SEALMARK_BIN, "verify-digest", str(path), digest_arg],
+            capture_output=True,
+            env=self._preload_env(SEALMARK_READFAIL_PATH=str(path)),
+        )
 
     def write_file(self, relative_path, content):
         path = self.tmp / relative_path
@@ -270,6 +324,108 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
 
         result = self.run_verify(str(path), digest_of(b"cannot read me"))
         self.assertFileFailure(result, path)
+
+    # -- read failure after a successful open (exit code 1) -------------
+    #
+    # A regular file can open fine and then fail on read() after some of
+    # its bytes have been delivered. Staged through the LD_PRELOAD injector
+    # (real EIO on one target fd): the result must be a file failure, never
+    # a match (even against the digest of exactly the delivered prefix) and
+    # never a mismatch.
+
+    @requires_readfail_preload
+    def test_read_error_after_partial_content_is_file_failure_not_match(self):
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("readfail/binary document.dat", content)
+
+        # The bytes delivered before the failure include a NUL and line
+        # endings, so the guarantee covers ordinary binary documents too.
+        self.assertIn(b"\x00", content[:CHUNK_SIZE])
+        self.assertIn(b"\n", content[:CHUNK_SIZE])
+
+        # Control: with no fault armed the same file matches its full
+        # digest, proving the failure below is genuinely read-induced.
+        self.assertMatch(self.run_verify_preloaded(path, digest_of(content)))
+
+        for after in (1, CHUNK_SIZE, CHUNK_SIZE + 4096, 2 * CHUNK_SIZE + 17):
+            with self.subTest(after=after):
+                # A well-formed expected digest that equals the digest of
+                # precisely the bytes delivered *before* the error.
+                prefix_digest = digest_of(content[:after])
+
+                result = self.run_verify_with_read_failure(
+                    path, after, prefix_digest
+                )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertNotEqual(result.stdout, b"match\n")
+                self.assertNotEqual(result.stdout, b"mismatch\n")
+                stderr = result.stderr
+                self.assertTrue(stderr.endswith(b"\n"))
+                self.assertIn(b"read", stderr.lower())
+                self.assertIn(os.fsencode(str(path)), stderr)
+                self.assertNotIn(b"match", stderr)
+                self.assertNotIn(b"mismatch", stderr)
+
+    @requires_readfail_preload
+    def test_read_error_after_partial_content_is_file_failure_not_mismatch(self):
+        content = make_content(2 * CHUNK_SIZE + 31)
+        path = self.write_file("readfail/other document.bin", content)
+
+        # Any well-formed digest different from the full content and from
+        # the delivered-prefix digest: under a read failure it must still
+        # report the read failure, never "mismatch".
+        prefix = content[:CHUNK_SIZE + 4096]
+        other_digest = digest_of(content + b"different")
+        self.assertNotEqual(other_digest, digest_of(content))
+        self.assertNotEqual(other_digest, digest_of(prefix))
+
+        result = self.run_verify_with_read_failure(
+            path, CHUNK_SIZE + 4096, other_digest
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"mismatch", result.stdout + result.stderr)
+        self.assertNotIn(b"match", result.stdout)
+        self.assertIn(b"read", result.stderr.lower())
+        self.assertIn(os.fsencode(str(path)), result.stderr)
+
+    @requires_readfail_preload
+    def test_short_final_read_and_eof_still_match_under_preload(self):
+        # The injector is loaded but unarmed, so a final short read, an
+        # exact-boundary ending and an empty file remain normal matches:
+        # a short gcount() is normal EOF, not a read error.
+        for size in (0, 1, CHUNK_SIZE - 1, CHUNK_SIZE,
+                     CHUNK_SIZE + 1, 2 * CHUNK_SIZE + 13):
+            with self.subTest(size=size):
+                content = make_content(size)
+                path = self.write_file(f"eof/{size}.bin", content)
+                self.assertMatch(
+                    self.run_verify_preloaded(path, digest_of(content))
+                )
+
+    @requires_readfail_preload
+    def test_injected_fault_does_not_touch_other_files(self):
+        target = self.write_file("iso/target.bin",
+                                 make_content(2 * CHUNK_SIZE))
+        other = self.write_file("iso/other.bin",
+                                make_content(CHUNK_SIZE + 7))
+        env = self._preload_env(
+            SEALMARK_READFAIL_PATH=str(target),
+            SEALMARK_READFAIL_AFTER="10",
+        )
+        result = subprocess.run(
+            [SEALMARK_BIN, "verify-digest", str(other),
+             digest_of(make_content(CHUNK_SIZE + 7))],
+            capture_output=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"match\n")
+        self.assertEqual(result.stderr, b"")
 
 
 if __name__ == "__main__":

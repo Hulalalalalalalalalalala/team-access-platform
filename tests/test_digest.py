@@ -12,8 +12,20 @@ The digest contract under test (see README):
 * an empty file is a valid input (standard empty-content SHA-256);
 * missing path / directory / other unreadable input: exit code 1 with an
   empty stdout and a stderr message that contains the path as passed;
+* a regular file that opens successfully and then fails on read() after
+  delivering part of its raw bytes: exit code 1, empty stdout, stderr says
+  the read failed and names the path -- distinct from normal EOF, where the
+  final short read (and an empty file) is still a success;
 * missing or empty path argument (and other usage errors): exit code 2
   with the usage text on stderr.
+
+The read-failure case is produced deterministically by a small LD_PRELOAD
+fault injector (tests/readfail_preload.c) that makes read() return EIO on
+one selected regular file after an exact number of bytes have been read.
+It needs no privileges, does not mutate the file, and does not depend on
+timing. Its path arrives in $SEALMARK_READFAIL_PRELOAD from CTest; the
+injector-based tests skip if it is unavailable, and fail loudly (never pass
+silently) if the fault does not actually take effect.
 
 All test content and paths are created by the tests themselves inside a
 fresh temporary directory, so the suite is independent of the working
@@ -36,6 +48,15 @@ from pathlib import Path
 CHUNK_SIZE = 64 * 1024
 
 SEALMARK_BIN = os.environ.get("SEALMARK_BIN")
+
+# Path to the LD_PRELOAD fault injector built by CMake (Linux only).
+READFAIL_PRELOAD = os.environ.get("SEALMARK_READFAIL_PRELOAD")
+
+requires_readfail_preload = unittest.skipUnless(
+    READFAIL_PRELOAD and Path(READFAIL_PRELOAD).is_file(),
+    "SEALMARK_READFAIL_PRELOAD is unavailable; mid-read failure cannot be "
+    "injected on this platform",
+)
 
 OUTPUT_RE = re.compile(rb"\Asha256:[0-9a-f]{64}\n\Z")
 EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -93,6 +114,42 @@ class SealmarkDigestTest(unittest.TestCase):
 
     def run_digest(self, path_arg):
         return self.run_sealmark("digest", path_arg)
+
+    def _preload_env(self, **extra):
+        env = dict(os.environ)
+        preload = READFAIL_PRELOAD
+        if env.get("LD_PRELOAD"):
+            preload = preload + ":" + env["LD_PRELOAD"]
+        env["LD_PRELOAD"] = preload
+        env.update(extra)
+        return env
+
+    def run_digest_with_read_failure(self, path, after):
+        """Run digest with the preloaded injector armed: read() on `path`
+        fails with EIO once `after` bytes have been delivered."""
+        env = self._preload_env(
+            SEALMARK_READFAIL_PATH=str(path),
+            SEALMARK_READFAIL_AFTER=str(after),
+        )
+        return subprocess.run(
+            [SEALMARK_BIN, "digest", str(path)],
+            capture_output=True,
+            env=env,
+        )
+
+    def run_digest_preloaded(self, path, after=None):
+        """Run digest under the preloaded injector. With `after` left None
+        no fault is armed (pure pass-through); with `after` set the fault is
+        scheduled at that byte offset, which is useful for the controls that
+        place the threshold at or beyond normal EOF."""
+        extra = {"SEALMARK_READFAIL_PATH": str(path)}
+        if after is not None:
+            extra["SEALMARK_READFAIL_AFTER"] = str(after)
+        return subprocess.run(
+            [SEALMARK_BIN, "digest", str(path)],
+            capture_output=True,
+            env=self._preload_env(**extra),
+        )
 
     def write_file(self, relative_path, content):
         path = self.tmp / relative_path
@@ -220,6 +277,86 @@ class SealmarkDigestTest(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertIn(os.fsencode(str(directory)), result.stderr)
         self.assertNotIn(b"Usage", result.stderr)
+
+    # -- read failure after a successful open (exit code 1) -------------
+    #
+    # A regular file may open fine and then have read() fail part-way
+    # through. That cannot be staged reliably with chmod/renames, so the
+    # LD_PRELOAD injector forces a real EIO on the target fd after an exact
+    # number of delivered bytes.
+
+    @requires_readfail_preload
+    def test_read_error_after_partial_content_fails_with_exit_code_1(self):
+        # More than one full chunk, and the offset below lands inside a
+        # later chunk so several reads succeed before the error.
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("readfail/binary doc.dat", content)
+
+        # Control first: without the fault the very same file is digested
+        # successfully, so a failure below is attributable to the injected
+        # read error rather than to a bad path, permissions, or setup.
+        healthy = self.run_digest(str(path))
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        self.assertEqual(healthy.stdout, expected_output(content))
+
+        # The pre-failure prefix deliberately contains a NUL byte and line
+        # endings (see make_content's head), covering ordinary binary
+        # documents rather than only plain text.
+        self.assertIn(b"\x00", content[:CHUNK_SIZE])
+        self.assertIn(b"\n", content[:CHUNK_SIZE])
+
+        for after in (1, CHUNK_SIZE, CHUNK_SIZE + 4096, 2 * CHUNK_SIZE + 17):
+            with self.subTest(after=after):
+                result = self.run_digest_with_read_failure(path, after)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                stderr = result.stderr
+                self.assertTrue(stderr.endswith(b"\n"))
+                # The message must describe a read failure (not an open or
+                # usage failure) and name the path exactly as passed.
+                self.assertIn(b"read", stderr.lower())
+                self.assertNotIn(b"Usage", stderr)
+                self.assertIn(os.fsencode(str(path)), stderr)
+
+    @requires_readfail_preload
+    def test_short_final_read_and_eof_are_not_treated_as_read_errors(self):
+        # The injector is loaded but unarmed: read() is passed straight
+        # through. A final read shorter than one chunk, a file ending
+        # exactly on a chunk boundary, and an empty file must all remain
+        # normal successes -- only a genuine read error may fail.
+        for size in (0, 1, CHUNK_SIZE - 1, CHUNK_SIZE,
+                     CHUNK_SIZE + 1, 2 * CHUNK_SIZE + 13):
+            with self.subTest(size=size):
+                content = make_content(size)
+                path = self.write_file(f"eof/{size}.bin", content)
+
+                result = self.run_digest_preloaded(path)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(result.stdout, expected_output(content))
+
+    @requires_readfail_preload
+    def test_injected_fault_only_affects_the_target_file(self):
+        target = self.write_file("iso/target.bin",
+                                 make_content(2 * CHUNK_SIZE))
+        other = self.write_file("iso/other.bin",
+                                make_content(CHUNK_SIZE + 7))
+        env = self._preload_env(
+            SEALMARK_READFAIL_PATH=str(target),
+            SEALMARK_READFAIL_AFTER="10",
+        )
+        result = subprocess.run(
+            [SEALMARK_BIN, "digest", str(other)],
+            capture_output=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout,
+                         expected_output(make_content(CHUNK_SIZE + 7)))
 
     # -- usage failures (exit code 2) ------------------------------------
 

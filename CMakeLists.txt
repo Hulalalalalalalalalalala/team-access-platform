@@ -16,6 +16,30 @@ endif()
 
 enable_testing()
 
+# Deterministic mid-read failure injection (Linux only): a small LD_PRELOAD
+# library that makes read() fail with EIO part-way through one chosen regular
+# file, so the "opened fine, then a read failed after partial data" path can
+# be exercised without root, FUSE, or relying on coincidental file changes.
+# Its location is handed to the Python tests through SEALMARK_READFAIL_PRELOAD;
+# when unset (non-Linux) the corresponding tests skip themselves.
+set(SEALMARK_TEST_ENV "SEALMARK_BIN=$<TARGET_FILE:sealmark>")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_language(C)
+    add_library(sealmark_readfail_preload MODULE tests/readfail_preload.c)
+    set_target_properties(
+        sealmark_readfail_preload
+        PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        PREFIX ""
+        C_STANDARD 11
+    )
+    target_link_libraries(sealmark_readfail_preload PRIVATE ${CMAKE_DL_LIBS})
+    list(
+        APPEND SEALMARK_TEST_ENV
+        "SEALMARK_READFAIL_PRELOAD=$<TARGET_FILE:sealmark_readfail_preload>"
+    )
+endif()
+
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     add_test(
@@ -25,7 +49,7 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(
         digest
         PROPERTIES
-        ENVIRONMENT "SEALMARK_BIN=$<TARGET_FILE:sealmark>"
+        ENVIRONMENT "${SEALMARK_TEST_ENV}"
     )
     add_test(
         NAME verify-digest
@@ -34,6 +58,6 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(
         verify-digest
         PROPERTIES
-        ENVIRONMENT "SEALMARK_BIN=$<TARGET_FILE:sealmark>"
+        ENVIRONMENT "${SEALMARK_TEST_ENV}"
     )
 endif()
