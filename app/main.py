@@ -955,6 +955,19 @@ def revoke_delegation(
                 "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
             ).fetchone()
             return delegation_dict(row)
+        if d["expires_at"] <= ts:
+            # The expiry instant has already arrived, so this delegation is
+            # time-expired, not revoked: record the same automatic expiry the
+            # lazy sweep would (no revoked_by/revoked_at, no audit row), so
+            # the outcome never depends on whether a list view swept first.
+            conn.execute(
+                "UPDATE delegations SET status = 'expired' WHERE id = ?",
+                (delegation_id,),
+            )
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return delegation_dict(row)
         conn.execute(
             "UPDATE delegations SET status = 'revoked', revoked_at = ?, revoked_by = ?"
             " WHERE id = ?",

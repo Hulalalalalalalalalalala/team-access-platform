@@ -389,6 +389,53 @@ def test_revoke_delegation(api: Api):
     assert audit_before == audit_after
 
 
+def test_revoke_expired_delegation_marks_expired(api: Api, db):
+    admin, org = _setup(api)
+    _, member_token, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+
+    # Expire it on disk WITHOUT listing first, so no lazy sweep has run.
+    db.execute("UPDATE delegations SET expires_at = 0 WHERE id = ?", (d["id"],))
+    db.commit()
+
+    audit_before = api.request("GET", f"/orgs/{org['id']}/audit",
+                               token=admin).json()["total"]
+
+    # Revoking an already time-expired delegation records the expiry, not a
+    # revocation: the outcome must not depend on a list view sweeping first.
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke", token=admin)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "expired"
+    assert body["revoked_by"] is None
+    assert body["revoked_at"] is None
+    assert body["id"] == d["id"]
+    assert body["grantor_id"] == d["grantor_id"]
+    assert body["delegate_id"] == d["delegate_id"]
+    assert body["starts_at"] == d["starts_at"]
+    assert body["expires_at"] == 0
+
+    # No revocation/expiry audit row.
+    audit_after = api.request("GET", f"/orgs/{org['id']}/audit",
+                              token=admin).json()["total"]
+    assert audit_after == audit_before
+
+    # Admin list and the delegate see the same expired result.
+    lst = api.request("GET", f"/orgs/{org['id']}/delegations",
+                      token=admin).json()["delegations"]
+    assert next(x for x in lst if x["id"] == d["id"])["status"] == "expired"
+    lst2 = api.request("GET", f"/orgs/{org['id']}/delegations",
+                       token=member_token).json()["delegations"]
+    assert next(x for x in lst2 if x["id"] == d["id"])["status"] == "expired"
+
+    # Repeat revocation stays expired and writes no audit.
+    r2 = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke", token=admin)
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "expired"
+    assert api.request("GET", f"/orgs/{org['id']}/audit",
+                       token=admin).json()["total"] == audit_before
+
+
 def test_revoke_delegation_not_found(api: Api):
     admin, org = _setup(api)
     _, _, member_id = _add_member(api, admin, org["id"])
