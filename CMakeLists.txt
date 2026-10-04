@@ -27,4 +27,13 @@ if(Python3_Interpreter_FOUND)
         PROPERTIES
             ENVIRONMENT "SEALMARK_BIN=$<TARGET_FILE:sealmark>"
     )
+    add_test(
+        NAME verify-digest
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_verify_digest.py
+    )
+    set_tests_properties(
+        verify-digest
+        PROPERTIES
+            ENVIRONMENT "SEALMARK_BIN=$<TARGET_FILE:sealmark>"
+    )
 endif()
