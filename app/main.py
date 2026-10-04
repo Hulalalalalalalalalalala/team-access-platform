@@ -36,6 +36,7 @@ import logging
 import re
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request
@@ -1238,6 +1239,205 @@ def accept_invite(
 
 # ========================================================== member management
 
+# Shared member-adjustment rules. Both mutating entry points that change a
+# member's role/status — single-member PATCH and batch PATCH — go through the
+# SAME machinery below, so the rules live in exactly one place:
+#   * a field left out of the request keeps the member's current value;
+#   * a request whose resolved values equal the current values still succeeds
+#     and returns the member, but neither touches ``updated_at`` nor writes a
+#     ``member.updated`` audit row;
+#   * the organization must end with at least one ACTIVE administrator,
+#     judged against the WHOLE change set's final state (a promotion earlier
+#     or later in the same submission offsets a demotion regardless of order);
+#   * every target must currently belong to THIS organization or the whole
+#     operation fails with 404 before anything is written;
+#   * the membership writes, their audit rows and the permanent delegation
+#     invalidations they cause commit in ONE transaction (or roll back
+#     together); only actually-changed members can invalidate a delegation;
+#   * responses report the members' FINAL roster state, in submission order.
+# What differs between the entry points stays outside this core: their request
+# validation (422), response envelopes (``membership`` vs ``batch_id`` +
+# ``members``), idempotency scopes/replay checks and audit shapes (the single
+# path stamps no batch_id, so its delegation audit keeps the scalar
+# ``triggered_by`` member id; the batch path carries the batch marker and the
+# id list — see ``_invalidate_delegations_for_member_changes``).
+
+
+@dataclass(frozen=True)
+class _MemberAdjustment:
+    """One requested role/status adjustment, in submission order.
+
+    ``role``/``status`` of None means the field was not submitted and must
+    keep its current value. Both entry points build these from their own
+    request models, which already enforce the value enums.
+    """
+
+    user_id: int
+    role: Optional[str] = None
+    status: Optional[str] = None
+
+
+def _member_row(c: sqlite3.Connection, org_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    """The membership row (with username) of ``user_id`` in THIS org, or None.
+
+    Used for both the pre-change target lookups and the post-change response
+    reads, so the stored/final state is assembled identically by every member
+    entry point.
+    """
+    return c.execute(
+        """
+        SELECT m.id, m.org_id, m.user_id, u.username, m.role, m.status,
+               m.created_at, m.updated_at
+        FROM memberships m JOIN users u ON u.id = m.user_id
+        WHERE m.org_id = ? AND m.user_id = ?
+        """,
+        (org_id, user_id),
+    ).fetchone()
+
+
+def _check_member_admin_session(
+    c: sqlite3.Connection, user: CurrentUser, org_id: int, request_token: str
+) -> None:
+    """Authorize a member adjustment at EXECUTION time, shared by both PATCHes.
+
+    The carried session (Bearer or X-Session-Token — ``_extract_token`` keeps
+    the existing precedence) only proved it was valid when the request
+    arrived. The adjustment must instead be authorized by the session state
+    at the moment it actually runs inside the write transaction: while queued
+    on the IMMEDIATE lock the session can be logged out, revoked by
+    logout-others / a password change, or reach its expiry instant
+    (``expires_at <= now`` is invalid). Any of those fails closed with 401,
+    and another still-valid session of the same account can never substitute
+    — the check is keyed to this token hash alone; revoking only the
+    account's OTHER sessions leaves this one live and the operation proceeds.
+
+    This deliberately runs ahead of the membership check (403), the target
+    lookups (404), the last-admin invariant (409) and the idempotency lookup
+    (409 / stored replay), and before anything is written, so a 401 here
+    leaves every target's role/status/updated_at untouched, invalidates no
+    delegation and stores no idempotency record — on first attempts (keyed or
+    not) and on replays of a stored success alike (``_run_idempotent`` calls
+    the permission check on every path before any replay is returned).
+    """
+    revalidate_session(c, request_token, now_ts())
+    require_membership(c, user, org_id, admin=True)
+
+
+def _apply_member_adjustments(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    actor_id: int,
+    adjustments: list[_MemberAdjustment],
+    ts: int,
+    batch_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Apply an ordered set of member role/status adjustments in ONE txn.
+
+    The single-member and batch member PATCH entry points share this whole
+    pipeline; the caller's transaction guarantees atomicity and
+    ``_run_idempotent`` serializes idempotent retries around it.
+
+    Steps, in order:
+      1. Load every target first. A target outside THIS organization fails
+         the WHOLE operation with 404 ``member_not_found`` and reveals
+         nothing about other orgs; nothing has been written yet, so the
+         batch stays exactly as it was.
+      2. Resolve each target's final role/status (an omitted field keeps the
+         current value) and enforce the last-active-administrator invariant
+         against the COMPLETE final picture: active admins untouched by the
+         change set plus targeted members whose final state is an active
+         admin. A promotion in the same set offsets a demotion regardless of
+         submission order; with one adjustment this is exactly the
+         single-member rule that the last active admin cannot be demoted or
+         disabled (self-targeted operations included).
+      3. Write only members that actually changed. Unchanged members are
+         still returned but keep ``updated_at`` and get no audit row; changed
+         members get one ``member.updated`` audit with the actor and the
+         before/after role/status, stamped with ``batch_id`` on the batch
+         path only.
+      4. Permanently invalidate active delegations tied to a CHANGED member
+         through the shared invalidation path (same txn; one row even when
+         both parties lose eligibility in one batch; restoring later never
+         revives them).
+      5. Return every target's FINAL membership, in SUBMISSION order.
+    """
+    ordered: list[tuple[sqlite3.Row, str, str]] = []
+    for adj in adjustments:
+        m = _member_row(c, org_id, adj.user_id)
+        if m is None:
+            raise not_found("member_not_found", "member not found")
+        ordered.append((m, adj.role or m["role"], adj.status or m["status"]))
+
+    # Count active administrators that are NOT targeted, then add the targeted
+    # members whose FINAL state is an active admin. Untouched admins plus
+    # surviving targeted admins must leave at least one active administrator.
+    # For a single-item set ``targeted`` is 0-or-1, so this reduces to: an
+    # active admin may only leave that state when another active admin exists.
+    total_active_admins = c.execute(
+        "SELECT COUNT(*) AS n FROM memberships"
+        " WHERE org_id = ? AND role = 'admin' AND status = 'active'",
+        (org_id,),
+    ).fetchone()["n"]
+    targeted_active_admins = sum(
+        1 for m, _, _ in ordered if m["role"] == "admin" and m["status"] == "active"
+    )
+    surviving_targeted = sum(
+        1 for _, new_role, new_status in ordered
+        if new_role == "admin" and new_status == "active"
+    )
+    untouched_admins = total_active_admins - targeted_active_admins
+    if untouched_admins + surviving_targeted == 0:
+        raise conflict(
+            "last_admin_required",
+            "organization must retain at least one active administrator",
+        )
+
+    changed_states: dict[int, tuple[str, str]] = {}
+    for m, new_role, new_status in ordered:
+        if new_role == m["role"] and new_status == m["status"]:
+            # Equal submitted and current values: still a success for this
+            # member, but no timestamp bump and no change audit.
+            continue
+        c.execute(
+            "UPDATE memberships SET role = ?, status = ?, updated_at = ? WHERE id = ?",
+            (new_role, new_status, ts, m["id"]),
+        )
+        changed_states[m["user_id"]] = (new_role, new_status)
+        add_audit(
+            c, org_id=org_id, actor_id=actor_id, action="member.updated",
+            target_type="membership", target_id=m["id"],
+            before={"role": m["role"], "status": m["status"]},
+            after={"role": new_role, "status": new_status},
+            batch_id=batch_id, ts=ts,
+        )
+
+    # Delegation invalidation commits in the SAME transaction. Only changed
+    # members are passed, so an unchanged member invalidates nothing; the
+    # shared helper also keeps the single-path (scalar triggered_by, no
+    # batch_id) and batch-path (id list + batch marker) audit shapes.
+    _invalidate_delegations_for_member_changes(
+        c, org_id=org_id, changed_states=changed_states,
+        actor_id=actor_id, batch_id=batch_id, ts=ts,
+    )
+
+    # Final member info in SUBMISSION order (re-read so changed and unchanged
+    # members alike report their roster-final state).
+    final_rows: dict[int, sqlite3.Row] = {}
+    rows = c.execute(
+        """
+        SELECT m.org_id, m.user_id, u.username, m.role, m.status,
+               m.created_at, m.updated_at
+        FROM memberships m JOIN users u ON u.id = m.user_id
+        WHERE m.org_id = ?
+        """,
+        (org_id,),
+    ).fetchall()
+    for r in rows:
+        final_rows[r["user_id"]] = r
+    return [membership_dict(final_rows[adj.user_id]) for adj in adjustments]
+
+
 @app.patch("/orgs/{org_id}/members/batch")
 def batch_update_members(
     org_id: int,
@@ -1258,133 +1458,25 @@ def batch_update_members(
             raise ApiError(422, "validation_error", "duplicate user_id in changes")
         seen.add(ch.user_id)
 
-    # The one session actually carried by THIS request (Bearer or
-    # X-Session-Token; ``current_user`` already applied the existing
-    # precedence and proved it valid when the request arrived). That arrival
-    # check alone is not enough: the request may then wait behind the write
-    # lock, and the session can be logged out, revoked by logout-others or a
-    # password change, or reach its expiry while waiting. The batch must be
-    # authorized by the session state when it actually takes effect, so the
-    # SAME session is re-validated INSIDE the write transaction (see
-    # ``_check_perm``) — exactly as the single-member entry point does.
+    # The session carried by THIS request is re-validated inside the write
+    # transaction by the shared permission check (see
+    # ``_check_member_admin_session`` for the full ordering/atomicity rules,
+    # identical for both member-adjustment entry points).
     request_token = user.token
-
-    def _check_perm(c: sqlite3.Connection) -> None:
-        # Re-validate the EXACT session this request carries, INSIDE the
-        # IMMEDIATE write transaction, before any other check. BEGIN
-        # IMMEDIATE serializes this batch against the logout /
-        # logout-others / password-change transactions (all writers): once
-        # this check reads the session as live and the transaction goes on to
-        # change members, no revocation can commit in between; and if a
-        # revocation committed first — or the expiry instant arrived
-        # (expires_at <= now) while the request was waiting — the whole batch
-        # fails closed with 401. Another still-valid session of the same
-        # account, or an unchanged administrator identity, cannot rescue this
-        # one: authorization is keyed to this token hash alone. Conversely,
-        # revoking only the account's OTHER sessions leaves this one live and
-        # the batch proceeds.
-        #
-        # This runs ahead of the membership check (403), the per-target
-        # lookups (404), the last-admin invariant (409) and the idempotency
-        # lookup (409 / stored replay), so an invalid session is always
-        # answered 401 first; and it runs before anything is written, so a
-        # 401 here leaves every target's role/status/updated_at untouched,
-        # invalidates no delegation and stores no idempotency record — on
-        # first attempts (keyed or not) and on replays of a stored success
-        # alike (``_run_idempotent`` calls ``check_perm`` on every path
-        # before any replay is returned, and a rejected replay never rewrites
-        # the stored success).
-        revalidate_session(c, request_token, now_ts())
-        require_membership(c, user, org_id, admin=True)
+    adjustments = [_MemberAdjustment(ch.user_id, ch.role, ch.status) for ch in body.changes]
 
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
-        # Load every target first; a target outside THIS organization fails
-        # the whole batch with 404 and reveals nothing about other orgs.
-        ordered: list[tuple[sqlite3.Row, str, str]] = []
-        for ch in body.changes:
-            m = c.execute(
-                """
-                SELECT m.*, u.username FROM memberships m JOIN users u ON u.id = m.user_id
-                WHERE m.org_id = ? AND m.user_id = ?
-                """,
-                (org_id, ch.user_id),
-            ).fetchone()
-            if m is None:
-                raise not_found("member_not_found", "member not found")
-            new_role = ch.role or m["role"]
-            new_status = ch.status or m["status"]
-            ordered.append((m, new_role, new_status))
-
-        # Order-independent last-active-admin invariant. Count active admins
-        # that are untouched by the batch, then add targeted members whose
-        # FINAL state is an active admin (a promotion in the same batch can
-        # offset a demotion regardless of list order).
-        total_active_admins = c.execute(
-            "SELECT COUNT(*) AS n FROM memberships"
-            " WHERE org_id = ? AND role = 'admin' AND status = 'active'",
-            (org_id,),
-        ).fetchone()["n"]
-        targeted_active_admins = sum(
-            1 for m, _, _ in ordered if m["role"] == "admin" and m["status"] == "active"
-        )
-        surviving_targeted = sum(
-            1 for _, nr, ns in ordered if nr == "admin" and ns == "active"
-        )
-        untouched_admins = total_active_admins - targeted_active_admins
-        if untouched_admins + surviving_targeted == 0:
-            raise conflict(
-                "last_admin_required",
-                "organization must retain at least one active administrator",
-            )
-
         batch_id = generate_batch_id()
-        changed_states: dict[int, tuple[str, str]] = {}
-        for m, new_role, new_status in ordered:
-            before = {"role": m["role"], "status": m["status"]}
-            if new_role != m["role"] or new_status != m["status"]:
-                # Unchanged members are returned but keep updated_at and get
-                # no audit row.
-                c.execute(
-                    "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
-                    " WHERE id = ?",
-                    (new_role, new_status, ts, m["id"]),
-                )
-                changed_states[m["user_id"]] = (new_role, new_status)
-                add_audit(
-                    c, org_id=org_id, actor_id=user.id, action="member.updated",
-                    target_type="membership", target_id=m["id"],
-                    before=before, after={"role": new_role, "status": new_status},
-                    batch_id=batch_id, ts=ts,
-                )
-
-        # Delegation invalidation commits in the SAME transaction; one row
-        # per affected active delegation even when both parties lose
-        # eligibility in this batch.
-        _invalidate_delegations_for_member_changes(
-            c, org_id=org_id, changed_states=changed_states,
-            actor_id=user.id, batch_id=batch_id, ts=ts,
+        members_out = _apply_member_adjustments(
+            c, org_id=org_id, actor_id=user.id, adjustments=adjustments,
+            ts=ts, batch_id=batch_id,
         )
-
-        # Final member info in SUBMISSION order.
-        final_rows: dict[int, sqlite3.Row] = {}
-        rows = c.execute(
-            """
-            SELECT m.org_id, m.user_id, u.username, m.role, m.status,
-                   m.created_at, m.updated_at
-            FROM memberships m JOIN users u ON u.id = m.user_id
-            WHERE m.org_id = ?
-            """,
-            (org_id,),
-        ).fetchall()
-        for r in rows:
-            final_rows[r["user_id"]] = r
-        members_out = [membership_dict(final_rows[ch.user_id]) for ch in body.changes]
         return 200, {"batch_id": batch_id, "members": members_out}
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_batch_update(org_id),
         idempotency_key, request_body,
-        check_perm=_check_perm,
+        check_perm=lambda c: _check_member_admin_session(c, user, org_id, request_token),
         perform=_perform,
     )
     return resp
@@ -1403,113 +1495,24 @@ def update_member(
     if body.role is None and body.status is None:
         raise ApiError(422, "validation_error", "role or status is required")
 
-    # The one session actually carried by THIS request (Bearer or
-    # X-Session-Token; ``current_user`` already applied the existing
-    # precedence and proved it valid when the request arrived). That arrival
-    # check alone is not enough: the request may then wait behind the write
-    # lock, and the session can be logged out, revoked by logout-others or a
-    # password change, or reach its expiry while waiting. The adjustment must
-    # be authorized by the session state when it actually takes effect, so
-    # the SAME session is re-validated INSIDE the write transaction (see
-    # ``_check_perm``).
+    # The session carried by THIS request is re-validated inside the write
+    # transaction by the shared permission check (see
+    # ``_check_member_admin_session`` for the full ordering/atomicity rules,
+    # identical for both member-adjustment entry points).
     request_token = user.token
-
-    def _check_perm(c: sqlite3.Connection) -> None:
-        # Re-validate the EXACT session this request carries, INSIDE the
-        # IMMEDIATE write transaction, before any other check. BEGIN
-        # IMMEDIATE serializes this adjustment against the logout /
-        # logout-others / password-change transactions (all writers): once
-        # this check reads the session as live and the transaction goes on to
-        # change the member, no revocation can commit in between; and if a
-        # revocation committed first — or the expiry instant arrived
-        # (expires_at <= now) while the request was waiting — the adjustment
-        # fails closed with 401. Another still-valid session of the same
-        # account cannot rescue this one: authorization is keyed to this
-        # token hash alone. Conversely, revoking only the account's OTHER
-        # sessions leaves this one live and the adjustment proceeds.
-        #
-        # This runs ahead of the membership check (403), the target lookup
-        # (404), the last-admin invariant (409) and the idempotency lookup
-        # (409 / stored replay), so an invalid session is always answered 401
-        # first; and it runs before anything is written, so a 401 here keeps
-        # the target's role/status/updated_at untouched, invalidates no
-        # delegation and stores no idempotency record — on first attempts
-        # (keyed or not) and on replays of a stored success alike
-        # (``_run_idempotent`` calls ``check_perm`` on every path before any
-        # replay is returned, and a rejected replay never rewrites the stored
-        # success).
-        revalidate_session(c, request_token, now_ts())
-        require_membership(c, user, org_id, admin=True)
+    adjustment = _MemberAdjustment(target_user_id, body.role, body.status)
 
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
-        m = c.execute(
-            """
-            SELECT m.*, u.username FROM memberships m JOIN users u ON u.id = m.user_id
-            WHERE m.org_id = ? AND m.user_id = ?
-            """,
-            (org_id, target_user_id),
-        ).fetchone()
-        if m is None:
-            raise not_found("member_not_found", "member not found")
-
-        new_role = body.role or m["role"]
-        new_status = body.status or m["status"]
-
-        # Last-active-admin invariant (self-targeted operations included).
-        # It applies to ANY change that turns the target from an active
-        # administrator into something that is not an active administrator:
-        # demotion, disabling, or both at once. The count excludes the
-        # target, and the IMMEDIATE write lock serializes concurrent
-        # demotions/disables so they cannot both pass this check.
-        is_active_admin_now = m["role"] == "admin" and m["status"] == "active"
-        is_active_admin_after = new_role == "admin" and new_status == "active"
-        if is_active_admin_now and not is_active_admin_after:
-            other_active_admins = c.execute(
-                "SELECT COUNT(*) AS n FROM memberships"
-                " WHERE org_id = ? AND role = 'admin' AND status = 'active'"
-                " AND user_id != ?",
-                (org_id, target_user_id),
-            ).fetchone()["n"]
-            if other_active_admins == 0:
-                raise conflict(
-                    "last_admin_required",
-                    "organization must retain at least one active administrator",
-                )
-
-        before = {"role": m["role"], "status": m["status"]}
-        changed = new_role != m["role"] or new_status != m["status"]
-        if changed:
-            c.execute(
-                "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
-                " WHERE id = ?",
-                (new_role, new_status, ts, m["id"]),
-            )
-            add_audit(
-                c, org_id=org_id, actor_id=user.id, action="member.updated",
-                target_type="membership", target_id=m["id"],
-                before=before, after={"role": new_role, "status": new_status}, ts=ts,
-            )
-            # Member change invalidates affected delegations in the SAME
-            # transaction; the change and the invalidation audit commit or
-            # roll back together. The single-member path passes a one-entry
-            # change set and no batch_id, so the audit keeps its scalar
-            # member-id ``triggered_by`` shape.
-            _invalidate_delegations_for_member_changes(
-                c, org_id=org_id,
-                changed_states={target_user_id: (new_role, new_status)},
-                actor_id=user.id, ts=ts,
-            )
-
-        row = c.execute(
-            """
-            SELECT m.org_id, m.user_id, u.username, m.role, m.status,
-                   m.created_at, m.updated_at
-            FROM memberships m JOIN users u ON u.id = m.user_id
-            WHERE m.org_id = ? AND m.user_id = ?
-            """,
-            (org_id, target_user_id),
-        ).fetchone()
-        return 200, {"membership": membership_dict(row)}
+        # The single-member entry point is just the shared pipeline applied to
+        # one adjustment: same target-membership (404) rule, same omitted-field
+        # and no-op semantics, same last-active-admin invariant, same audit and
+        # delegation invalidation — with no batch_id, so the audit keeps the
+        # single-path scalar ``triggered_by`` shape. Its public envelope stays
+        # ``{"membership": ...}``.
+        members_out = _apply_member_adjustments(
+            c, org_id=org_id, actor_id=user.id, adjustments=[adjustment], ts=ts,
+        )
+        return 200, {"membership": members_out[0]}
 
     def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
         # The key binds not just to (operator, org, body) but to the TARGET
@@ -1532,7 +1535,7 @@ def update_member(
 
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
-        check_perm=_check_perm,
+        check_perm=lambda c: _check_member_admin_session(c, user, org_id, request_token),
         perform=_perform, replay_check=_replay_check,
     )
     return resp
