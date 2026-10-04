@@ -12,6 +12,10 @@ The digest contract under test (see README):
 * an empty file is a valid input (standard empty-content SHA-256);
 * missing path / directory / other unreadable input: exit code 1 with an
   empty stdout and a stderr message that contains the path as passed;
+* a regular file that opens fine but fails mid-read (some bytes already
+  delivered, then EIO): also exit code 1 with an empty stdout and the
+  path on stderr -- a short read at end of file is a valid ending, but a
+  real read error must never be mistaken for one;
 * missing or empty path argument (and other usage errors): exit code 2
   with the usage text on stderr.
 
@@ -20,7 +24,10 @@ fresh temporary directory, so the suite is independent of the working
 directory it is launched from and of any pre-existing files on the machine.
 
 The path to the sealmark executable is taken from $SEALMARK_BIN (wired up
-by CTest via the CMakeLists.txt add_test entry).
+by CTest via the CMakeLists.txt add_test entry).  The mid-read failure
+tests additionally use $SEALMARK_FAULT_LIB, an LD_PRELOAD injector built
+by CMake that fails a file's reads with EIO after a configured number of
+bytes; it needs no privileges and no cooperation from the filesystem.
 """
 
 import hashlib
@@ -36,6 +43,12 @@ from pathlib import Path
 CHUNK_SIZE = 64 * 1024
 
 SEALMARK_BIN = os.environ.get("SEALMARK_BIN")
+FAULT_LIB = os.environ.get("SEALMARK_FAULT_LIB")
+
+# Bytes served before the injected read failure: exactly one chunk, so
+# the failure provably happens after a successful full-chunk read, well
+# before the end of the test files used below.
+FAULT_AFTER = CHUNK_SIZE
 
 OUTPUT_RE = re.compile(rb"\Asha256:[0-9a-f]{64}\n\Z")
 EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -99,6 +112,46 @@ class SealmarkDigestTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return path
+
+    # -- mid-read failure harness ----------------------------------------
+
+    def require_fault_injector(self):
+        if os.name != "posix" or not Path("/proc/self/fd").is_dir():
+            self.skipTest("read-fault injector requires Linux with /proc")
+        if not FAULT_LIB:
+            raise RuntimeError(
+                "SEALMARK_FAULT_LIB is not set; build via CMake so the "
+                "read-fault injector library is available"
+            )
+        if not Path(FAULT_LIB).is_file():
+            raise RuntimeError(
+                f"SEALMARK_FAULT_LIB does not point to a file: {FAULT_LIB}"
+            )
+
+    def run_with_read_fault(self, target_path, *args, fault_after=FAULT_AFTER):
+        """Run sealmark with the read-fault injector preloaded.
+
+        The injector serves ``fault_after`` bytes of ``target_path``
+        normally and then fails the file's next read with EIO.  Returns
+        ``(result, served)`` where ``served`` is how many bytes were
+        delivered before the failure, or None when no fault was injected
+        (e.g. the file ended before the budget ran out).
+        """
+        self.require_fault_injector()
+        report = self.tmp / "read-fault-report.txt"
+        report.unlink(missing_ok=True)
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = FAULT_LIB
+        env["SEALMARK_FAULT_PATH"] = str(target_path)
+        env["SEALMARK_FAULT_AFTER"] = str(fault_after)
+        env["SEALMARK_FAULT_REPORT"] = str(report)
+        result = subprocess.run([SEALMARK_BIN, *args], capture_output=True, env=env)
+        served = None
+        try:
+            served = int(report.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            pass
+        return result, served
 
     # -- success ---------------------------------------------------------
 
@@ -220,6 +273,52 @@ class SealmarkDigestTest(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertIn(os.fsencode(str(directory)), result.stderr)
         self.assertNotIn(b"Usage", result.stderr)
+
+    # -- read failure mid-stream (exit code 1) ---------------------------
+
+    def test_read_failure_mid_stream_fails_with_exit_code_1(self):
+        # A regular file that opens fine and yields one full chunk of
+        # binary content (NUL bytes and newlines included) before the next
+        # read fails with EIO.  That is a read error, not a valid end of
+        # file, so no digest may be produced from the partial content.
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("midread/文档 partial.bin", content)
+
+        result, served = self.run_with_read_fault(path, "digest", str(path))
+
+        # The fault scenario must actually have been established -- a
+        # silently absent fault must not count as a verified failure.
+        self.assertIsNotNone(served, "read fault was never injected")
+        self.assertGreater(served, 0)
+        self.assertLess(served, len(content))
+        prefix = content[:served]
+        self.assertIn(b"\x00", prefix)
+        self.assertIn(b"\n", prefix)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(os.fsencode(str(path)), result.stderr)
+        self.assertIn(b"read", result.stderr)
+        self.assertNotIn(b"Usage", result.stderr)
+
+    def test_normal_end_of_file_is_not_confused_with_a_read_failure(self):
+        # With the injector loaded but configured to fire only past the
+        # end of the file, the existing end-of-file behaviour must be
+        # unchanged: a short final read is a valid ending, and an empty
+        # file is valid input.  Only a real read error is a failure.
+        for size in (CHUNK_SIZE + 13, 1, 0):
+            with self.subTest(size=size):
+                content = make_content(size)
+                path = self.write_file(f"eof/{size}.bin", content)
+
+                result, served = self.run_with_read_fault(
+                    path, "digest", str(path), fault_after=len(content) + 1
+                )
+
+                self.assertIsNone(served, "fault fired before end of file")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(result.stdout, expected_output(content))
 
     # -- usage failures (exit code 2) ------------------------------------
 

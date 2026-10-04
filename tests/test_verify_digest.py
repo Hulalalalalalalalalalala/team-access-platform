@@ -15,10 +15,19 @@ The verify-digest contract under test (see README):
   the path is also bad): exit code 2, empty stdout, usage text on stderr
   mentioning the new command -- never reported as a mismatch;
 * unreadable / missing / non-regular file or digest-computation failure:
-  exit code 1, empty stdout, stderr names the path, and no success output.
+  exit code 1, empty stdout, stderr names the path, and no success output;
+* a regular file that opens fine but fails mid-read (some bytes already
+  delivered, then EIO): likewise exit code 1 with the path on stderr --
+  never ``match`` and never ``mismatch``, even if the expected digest
+  happens to equal the digest of the bytes read before the failure; only
+  a file read successfully from start to end gets a verdict.
 
 All test content and paths are created inside a fresh temporary directory.
-The executable path comes from $SEALMARK_BIN (wired up by CTest).
+The executable path comes from $SEALMARK_BIN (wired up by CTest).  The
+mid-read failure tests additionally use $SEALMARK_FAULT_LIB, an
+LD_PRELOAD injector built by CMake that fails a file's reads with EIO
+after a configured number of bytes; it needs no privileges and no
+cooperation from the filesystem.
 """
 
 import hashlib
@@ -33,6 +42,12 @@ from pathlib import Path
 CHUNK_SIZE = 64 * 1024
 
 SEALMARK_BIN = os.environ.get("SEALMARK_BIN")
+FAULT_LIB = os.environ.get("SEALMARK_FAULT_LIB")
+
+# Bytes served before the injected read failure: exactly one chunk, so
+# the failure provably happens after a successful full-chunk read, well
+# before the end of the test files used below.
+FAULT_AFTER = CHUNK_SIZE
 
 EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -88,6 +103,46 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return path
+
+    # -- mid-read failure harness ----------------------------------------
+
+    def require_fault_injector(self):
+        if os.name != "posix" or not Path("/proc/self/fd").is_dir():
+            self.skipTest("read-fault injector requires Linux with /proc")
+        if not FAULT_LIB:
+            raise RuntimeError(
+                "SEALMARK_FAULT_LIB is not set; build via CMake so the "
+                "read-fault injector library is available"
+            )
+        if not Path(FAULT_LIB).is_file():
+            raise RuntimeError(
+                f"SEALMARK_FAULT_LIB does not point to a file: {FAULT_LIB}"
+            )
+
+    def run_with_read_fault(self, target_path, *args, fault_after=FAULT_AFTER):
+        """Run sealmark with the read-fault injector preloaded.
+
+        The injector serves ``fault_after`` bytes of ``target_path``
+        normally and then fails the file's next read with EIO.  Returns
+        ``(result, served)`` where ``served`` is how many bytes were
+        delivered before the failure, or None when no fault was injected
+        (e.g. the file ended before the budget ran out).
+        """
+        self.require_fault_injector()
+        report = self.tmp / "read-fault-report.txt"
+        report.unlink(missing_ok=True)
+        env = dict(os.environ)
+        env["LD_PRELOAD"] = FAULT_LIB
+        env["SEALMARK_FAULT_PATH"] = str(target_path)
+        env["SEALMARK_FAULT_AFTER"] = str(fault_after)
+        env["SEALMARK_FAULT_REPORT"] = str(report)
+        result = subprocess.run([SEALMARK_BIN, *args], capture_output=True, env=env)
+        served = None
+        try:
+            served = int(report.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            pass
+        return result, served
 
     # -- match -----------------------------------------------------------
 
@@ -270,6 +325,82 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
 
         result = self.run_verify(str(path), digest_of(b"cannot read me"))
         self.assertFileFailure(result, path)
+
+    # -- read failure mid-stream (exit code 1) ---------------------------
+
+    def test_read_failure_mid_stream_is_an_error_not_a_verdict(self):
+        # A regular file that opens fine and yields one full chunk of
+        # binary content (NUL bytes and newlines included) before the next
+        # read fails with EIO.  Only a file read successfully from start
+        # to end may get a match/mismatch verdict.
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("midread/文档 partial.bin", content)
+
+        # First run learns where the (deterministic) fault fires.
+        probe, served = self.run_with_read_fault(
+            path, "verify-digest", str(path), digest_of(content)
+        )
+
+        # The fault scenario must actually have been established -- a
+        # silently absent fault must not count as a verified failure.
+        self.assertIsNotNone(served, "read fault was never injected")
+        self.assertGreater(served, 0)
+        self.assertLess(served, len(content))
+        prefix = content[:served]
+        self.assertIn(b"\x00", prefix)
+        self.assertIn(b"\n", prefix)
+        self.assertFileFailure(probe, path)
+        self.assertIn(b"read", probe.stderr)
+
+        # An expected digest equal to the digest of exactly the bytes
+        # read before the failure must still be a read failure, never a
+        # match: the file was not read to its end.
+        prefix_result, prefix_served = self.run_with_read_fault(
+            path, "verify-digest", str(path), digest_of(prefix)
+        )
+        self.assertEqual(prefix_served, served)  # fault point is deterministic
+        self.assertFileFailure(prefix_result, path)
+        self.assertIn(b"read", prefix_result.stderr)
+
+        # A different well-formed digest (here the true digest of the
+        # complete file) must likewise be a read failure, never a
+        # mismatch.
+        other_result, _ = self.run_with_read_fault(
+            path, "verify-digest", str(path), digest_of(content)
+        )
+        self.assertFileFailure(other_result, path)
+        self.assertIn(b"read", other_result.stderr)
+
+    def test_normal_end_of_file_is_not_confused_with_a_read_failure(self):
+        # With the injector loaded but configured to fire only past the
+        # end of the file, the existing verdicts must be unchanged: a
+        # short final read is a valid ending, an empty file is valid, and
+        # a genuinely different digest is still a plain mismatch.  Only a
+        # real read error is a failure.
+        content = make_content(CHUNK_SIZE + 13)
+        path = self.write_file("eof/partial-chunk.bin", content)
+
+        result, served = self.run_with_read_fault(
+            path, "verify-digest", str(path), digest_of(content),
+            fault_after=len(content) + 1,
+        )
+        self.assertIsNone(served, "fault fired before end of file")
+        self.assertMatch(result)
+
+        result, served = self.run_with_read_fault(
+            path, "verify-digest", str(path), digest_of(content + b"x"),
+            fault_after=len(content) + 1,
+        )
+        self.assertIsNone(served, "fault fired before end of file")
+        self.assertMismatch(result)
+
+        empty = self.write_file("eof/empty.bin", b"")
+        result, served = self.run_with_read_fault(
+            empty, "verify-digest", str(empty), f"sha256:{EMPTY_FILE_SHA256}",
+            fault_after=1,
+        )
+        self.assertIsNone(served, "fault fired before end of file")
+        self.assertMatch(result)
 
 
 if __name__ == "__main__":
