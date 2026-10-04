@@ -608,12 +608,13 @@ def _active_delegation(c: sqlite3.Connection, org_id: int, user_id: int, ts: int
 
 # Eligibility rules behind a delegation, in ONE place. A delegation stays
 # effective only while its grantor is an ACTIVE administrator and its
-# delegate is an ACTIVE ordinary member of the same organization. Both the
-# lazy sweep below and the member-change invalidation after PATCH (single
-# and batch entry points) derive their reasons from these predicates, so a
-# new eligibility rule is defined here once. Role/status may be None when a
-# membership row is missing (e.g. direct on-disk manipulation) — that never
-# qualifies.
+# delegate is an ACTIVE ordinary member of the same organization. The lazy
+# sweep below and the member-change invalidation shared by every member
+# mutation entry point (single PATCH, batch PATCH and DELETE removal) all
+# derive their reasons from these predicates, so a new eligibility rule is
+# defined here once. Role/status may be None when a membership row is
+# missing (e.g. a removed member, or direct on-disk manipulation) — that
+# never qualifies.
 def _grantor_qualifies(role: Optional[str], status: Optional[str]) -> bool:
     return role == "admin" and status == "active"
 
@@ -629,10 +630,11 @@ def _sweep_delegations(c: sqlite3.Connection, org_id: int, ts: int) -> None:
       (automatic, no audit row);
     * eligibility: an active delegation whose grantor is no longer an active
       admin, or whose delegate is no longer an active ordinary member, is
-      permanently ``invalidated``. The PATCH member endpoints perform the
-      primary, actor-bearing invalidation; this sweep is the safety net for
-      state changes that bypass them (e.g. direct on-disk manipulation), and
-      it records the invalidation with a NULL actor.
+      permanently ``invalidated``. The member endpoints (PATCH single/batch,
+      DELETE removal) perform the primary, actor-bearing invalidation; this
+      sweep is the safety net for state changes that bypass them (e.g.
+      direct on-disk manipulation), and it records the invalidation with a
+      NULL actor.
     """
     c.execute(
         "UPDATE delegations SET status = 'expired'"
@@ -679,38 +681,49 @@ def _invalidate_delegations_for_member_changes(
     c: sqlite3.Connection,
     *,
     org_id: int,
-    changed_states: dict[int, tuple[str, str]],
+    changed_states: dict[int, tuple[Optional[str], Optional[str]]],
     actor_id: int,
     ts: int,
     batch_id: Optional[str] = None,
-) -> None:
-    """Permanently invalidate active delegations hit by member role/status edits.
+    trigger: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Permanently invalidate active delegations hit by member changes.
 
-    Shared by BOTH PATCH member entry points (single member and batch) so the
-    eligibility judgement, the delegation status change and the invalidation
-    audit live in exactly one place; it runs in the SAME transaction as the
-    membership writes, so the member changes and every invalidation row
-    commit atomically or roll back together.
+    Shared by EVERY member mutation entry point — single-member PATCH, batch
+    PATCH and DELETE removal — so the eligibility judgement, the delegation
+    status change and the invalidation audit live in exactly one place; it
+    runs in the SAME transaction as the membership writes, so the member
+    changes and every invalidation row commit atomically or roll back
+    together.
 
     ``changed_states`` maps user_id -> (new_role, new_status) for members
-    that ACTUALLY changed. Only delegations tied to a changed member are
-    touched: unchanged members get no timestamp update and no audit. Only
-    ``active`` delegations qualify, so a row already revoked/invalidated is
-    never recorded twice and its stored reason is never rewritten.
-    Invalidation is permanent — later restoring role/status never revives
-    the delegation (only a fresh grant can).
+    that ACTUALLY changed; a removed member is represented as
+    ``(None, None)`` — no membership — which qualifies as neither grantor
+    nor delegate. Only delegations tied to a changed member are touched:
+    unchanged members get no timestamp update and no audit. Only ``active``
+    delegations qualify, so a row already revoked/invalidated is never
+    recorded twice and its stored reason is never rewritten. Invalidation is
+    permanent — later restoring role/status, or rejoining after a removal,
+    never revives the delegation (only a fresh grant can).
 
     When one delegation's grantor AND delegate both lose eligibility in the
     same change set, exactly ONE invalidation row is written; reasons appear
     in the fixed grantor-then-delegate order (``grantor_not_admin`` then
     ``delegate_ineligible``, comma-joined) and ``triggered_by`` lists the
     members actually responsible in that same order without duplicates. The
-    audit shape follows the entry point: the single-member path (no
-    ``batch_id``) records ``triggered_by`` as the one member id, while the
+    audit shape follows the entry point: the single-member paths (no
+    ``batch_id``) record ``triggered_by`` as the one member id, while the
     batch path records it as a member-id list and stamps ``batch_id``.
+    ``trigger`` (``"member_removed"`` from the DELETE endpoint) is echoed
+    into the audit's after-state when given.
+
+    Returns one ``{"id", "reason"}`` entry per invalidated delegation, in
+    the order the rows were processed, so the removal endpoint can embed
+    them in its ``member.removed`` audit record.
     """
+    invalidated: list[dict[str, Any]] = []
     if not changed_states:
-        return
+        return invalidated
     affected_ids = list(changed_states.keys())
     marks = ",".join("?" for _ in affected_ids)
     rows = c.execute(
@@ -742,16 +755,25 @@ def _invalidate_delegations_for_member_changes(
             " WHERE id = ?",
             (reason, ts, r["id"]),
         )
+        after: dict[str, Any] = {
+            "status": "invalidated",
+            "reason": reason,
+            # Single-member paths keep the scalar member id; the batch path
+            # carries the ordered, de-duplicated id list.
+            "triggered_by": triggered[0] if batch_id is None else triggered,
+        }
+        if trigger is not None:
+            # The removal endpoint marks its invalidations member_removed.
+            after["trigger"] = trigger
         add_audit(
             c, org_id=org_id, actor_id=actor_id, action="delegation.invalidated",
             target_type="delegation", target_id=r["id"],
             before={"status": "active"},
-            after={"status": "invalidated", "reason": reason,
-                   # Single-member path keeps the scalar member id; the batch
-                   # path carries the ordered, de-duplicated id list.
-                   "triggered_by": triggered[0] if batch_id is None else triggered},
+            after=after,
             batch_id=batch_id, ts=ts,
         )
+        invalidated.append({"id": r["id"], "reason": reason})
+    return invalidated
 
 
 @app.post("/orgs/{org_id}/delegations", status_code=201)
@@ -1605,43 +1627,22 @@ def remove_member(
                 )
 
         # Permanently invalidate every active delegation in which the target
-        # participates as grantor or delegate, reusing the existing
-        # invalidation reasons. Rejoining later never revives them. Sweep
-        # first so a merely time-expired delegation keeps its ``expired``
-        # state instead of being mislabelled; only still-EFFECTIVE
-        # delegations are invalidated here. A delegation never has the same
-        # user as both grantor and delegate, so at most one reason applies
-        # per row.
+        # participates as grantor or delegate, through the SAME shared
+        # invalidation path the PATCH endpoints use (a removed member is a
+        # member whose new state is "no membership", which qualifies as
+        # neither grantor nor delegate). Rejoining later never revives them.
+        # Sweep first so a merely time-expired delegation keeps its
+        # ``expired`` state instead of being mislabelled; only
+        # still-EFFECTIVE delegations are invalidated here. A delegation
+        # never has the same user as both grantor and delegate, so at most
+        # one reason applies per row. The change, the invalidations and
+        # their audits commit or roll back together.
         _sweep_delegations(c, org_id, ts)
-        deleg_rows = c.execute(
-            """
-            SELECT id, grantor_id, delegate_id FROM delegations
-            WHERE org_id = ? AND status = 'active'
-              AND (grantor_id = ? OR delegate_id = ?)
-            """,
-            (org_id, target_user_id, target_user_id),
-        ).fetchall()
-        invalidated: list[dict[str, Any]] = []
-        for r in deleg_rows:
-            reason = (
-                "grantor_not_admin"
-                if r["grantor_id"] == target_user_id
-                else "delegate_ineligible"
-            )
-            c.execute(
-                "UPDATE delegations SET status = 'invalidated', invalid_reason = ?,"
-                " invalidated_at = ? WHERE id = ?",
-                (reason, ts, r["id"]),
-            )
-            add_audit(
-                c, org_id=org_id, actor_id=user.id, action="delegation.invalidated",
-                target_type="delegation", target_id=r["id"],
-                before={"status": "active"},
-                after={"status": "invalidated", "reason": reason,
-                       "triggered_by": target_user_id, "trigger": "member_removed"},
-                ts=ts,
-            )
-            invalidated.append({"id": r["id"], "reason": reason})
+        invalidated = _invalidate_delegations_for_member_changes(
+            c, org_id=org_id,
+            changed_states={target_user_id: (None, None)},
+            actor_id=user.id, ts=ts, trigger="member_removed",
+        )
 
         # The membership itself disappears (disable/enable keep the row;
         # removal does not). ON DELETE rules do not apply here: the user,
