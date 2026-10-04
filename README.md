@@ -11,6 +11,20 @@
   吊销同账号其他所有有效会话并返回 `{"revoked_sessions":N}`（不含当前会话、
   已退出或已过期会话）；未加入组织、被停用或移除的账号同样可用；
   密码错误返回 `403 invalid_current_password`，任何失败都不吊销会话。
+  `POST /auth/password`（请求体 `current_password` 与 `new_password`，均为必填
+  字符串、长度 1–256，大小写及首尾空格有意义、原样保留）修改当前登录账号的
+  密码。仅要求有效登录：未加入组织、被停用或被移除的账号均可操作，不需要管理员
+  资格，Bearer 与 X-Session-Token 两种登录方式等价。成功返回 `200` 与
+  `{"password_changed":true}`，**不发放替代令牌**；密码更新与同账号**全部**
+  会话吊销（含当前会话）在同一事务原子生效。这也是它与“退出其他会话”的区别：
+  后者保留当前登录且不改密码，改密则连当前登录一起结束，用户须用新密码重新登录。
+  改密后旧密码登录返回 `401 invalid_credentials`，旧会话访问需要登录的入口返回
+  `401 unauthorized`；其他账号的会话，以及本账号的组织关系、角色与停用状态均不
+  变。合法请求但没有有效会话返回 `401 unauthorized`；当前密码错误返回
+  `403 invalid_current_password`；当前密码正确但新旧相同返回
+  `409 password_unchanged`；缺少字段、空字符串、非字符串或超过长度限制返回
+  `422 validation_error`，请求内容校验先于会话检查。以上失败均不改变密码、不
+  撤销会话。
 - **组织与角色**：登录用户可创建组织并自动成为管理员，也可加入多个组织；
   角色仅 `admin`（管理员）与 `member`（普通成员）两种。
   创建以**真正执行时**携带的会话状态为准：会话在请求进入写事务前被退出、
@@ -252,6 +266,63 @@ curl -s $B/orgs/1/delegations -H "Authorization: Bearer $TOK_A"
 curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $TOK_A"
 ```
 
+### 修改密码完整流程（独立可运行）
+
+下例使用虚构凭据，演示同一账号取得两个会话、用其中一个改密后两个旧会话全部失效，
+再用新密码重新登录并查询自己的组织。每个 `*_TOK` 变量都由对应登录响应中的
+`token` 字段取得；实际使用时把用户名 / 密码替换成自己的即可，改密成功后的正常
+操作一律使用**新会话**（接口不发放替代令牌）。
+
+```bash
+B=http://127.0.0.1:8000
+
+# 0. 注册一个虚构账号（已存在可跳过）
+curl -s -X POST $B/auth/register -H 'Content-Type: application/json' \
+  -d '{"username":"dave","password":"OldPass 1"}'
+
+# 1. 同一账号在两个设备上分别登录，取得两个会话令牌
+TOK_D1=$(curl -s -X POST $B/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"dave","password":"OldPass 1"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+TOK_D2=$(curl -s -X POST $B/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"dave","password":"OldPass 1"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 改密前两个会话都能正常使用；先用 TOK_D1 建一个组织，稍后验证组织关系保留
+curl -s -X POST $B/orgs -H "Authorization: Bearer $TOK_D1" \
+  -H 'Content-Type: application/json' -d '{"name":"Dave Co"}'
+curl -s $B/orgs -H "Authorization: Bearer $TOK_D1"
+# -> {"organizations":[{"id":1,"name":"Dave Co","role":"admin","status":"active",...}]}
+curl -s $B/orgs -H "Authorization: Bearer $TOK_D2"   # 同账号另一设备看到同样结果
+
+# 2. 用其中一个会话修改密码（首尾空格与大小写都有意义，原样发送）
+curl -i -X POST $B/auth/password -H "Authorization: Bearer $TOK_D1" \
+  -H 'Content-Type: application/json' \
+  -d '{"current_password":"OldPass 1","new_password":"  New Pass 2  "}'
+# -> 200 {"password_changed":true}，响应中不含任何令牌
+
+# 3. 同账号改密前的所有会话立即失效，包括发起改密的当前会话 TOK_D1
+curl -i $B/orgs -H "Authorization: Bearer $TOK_D1"   # -> 401 unauthorized
+curl -i $B/orgs -H "Authorization: Bearer $TOK_D2"   # -> 401 unauthorized（另一设备同样失效）
+# X-Session-Token 方式结果相同：
+curl -i $B/orgs -H "X-Session-Token: $TOK_D2"        # -> 401 unauthorized
+
+# 4. 旧密码不能再登录；用新密码重新登录取得新会话
+curl -i -X POST $B/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"dave","password":"OldPass 1"}'    # -> 401 invalid_credentials
+TOK_D3=$(curl -s -X POST $B/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"dave","password":"  New Pass 2  "}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 5. 改密后的正常操作使用新会话：查询自己加入的组织（组织关系、角色、停用状态均保留）
+curl -s $B/orgs -H "Authorization: Bearer $TOK_D3"
+# -> {"organizations":[{"id":1,"name":"Dave Co","role":"admin","status":"active",...}]}
+```
+
+与 `POST /auth/logout-others` 的区别：退出其他会话**保留当前登录**、不修改密码，
+只结束同账号其他设备的会话；修改密码则**连当前登录一起结束**（同账号全部会话
+失效）且更换密码，之后必须用新密码重新登录。
+
 ## API 一览
 
 | 方法 | 路径 | 鉴权 | 幂等键 |
@@ -260,6 +331,7 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 | POST | `/auth/login` | 无 | — |
 | POST | `/auth/logout` | 登录用户 | — |
 | POST | `/auth/logout-others` | 登录用户（不要求组织成员身份） | — |
+| POST | `/auth/password` | 登录用户（不要求组织成员身份 / 管理员资格；停用或被移除者也可用） | — |
 | POST | `/orgs` | 登录用户 | ✔ |
 | GET | `/orgs` | 登录用户 | — |
 | GET | `/orgs/{org_id}/members` | 本组织启用成员 | — |
@@ -286,20 +358,22 @@ curl -s -X POST $B/orgs/1/delegations/$DEL_ID/revoke -H "Authorization: Bearer $
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 401 | `unauthorized` | 未登录、会话无效 / 已退出 / 已过期 |
-| 401 | `invalid_credentials` | 登录用户名或密码错误（不区分） |
+| 401 | `unauthorized` | 未登录、会话无效 / 已退出 / 已过期 / 已被修改密码撤销 |
+| 401 | `invalid_credentials` | 登录用户名或密码错误（不区分；改密后用旧密码登录同样返回此码） |
 | 403 | `forbidden` | 非成员 / 停用成员 / 权限不足（组织是否存在不泄露） |
 | 403 | `username_mismatch` | 邀请绑定的用户名与当前登录用户不符 |
+| 403 | `invalid_current_password` | 修改密码 / 退出其他会话时提供的当前密码不正确（不改密码、不撤销会话） |
 | 409 | `username_taken` | 注册用户名重复 |
 | 409 | `org_name_taken` | 组织名重复 |
 | 409 | `invite_unavailable` | 邀请不存在 / 过期 / 已撤销 / 已使用 / 并发竞争失败 |
 | 409 | `already_member` | 已有成员再接受邀请（不覆盖角色 / 状态） |
+| 409 | `password_unchanged` | 修改密码时新密码与当前密码完全相同（含大小写与首尾空格；不改密码、不撤销会话） |
 | 409 | `last_admin_required` | 停用 / 降级 / 移除最后一个启用管理员（含自我操作、批量整批判定、并发竞争） |
 | 409 | `ineligible_member` | 委托目标不存在 / 已停用 / 不是普通成员 |
 | 409 | `delegation_exists` | 同一组织同一成员已有一份有效委托（含并发授予） |
 | 409 | `idempotency_conflict` | 同幂等键但请求体不同（移除为同键换目标 / 换组织） |
 | 404 | `not_found` / `member_not_found` | 路由不存在 / 目标成员不存在（调整或移除单人目标不属于本组织；批量中任一目标不属于本组织则整批 404） |
-| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段）；审计扫描的 `batch_id` 空串 / 超长、`page_size` 越界 |
+| 422 | `validation_error` | 请求体不合法（含批量数量越界、重复成员、缺少调整字段）；修改密码的 `current_password` / `new_password` 或退出其他会话的 `current_password` 缺少字段、为空 / 非字符串 / 超过 256 字符（请求内容校验先于会话检查，无有效会话时也先返回 422）；审计扫描的 `batch_id` 空串 / 超长、`page_size` 越界 |
 | 422 | `invalid_cursor` | 审计扫描游标伪造 / 损坏 / 属于其他组织，或续批时改变 / 追加 `batch_id` 筛选条件 |
 | 500 | `internal_error` | 服务器内部错误（不泄露细节） |
 
