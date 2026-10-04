@@ -1116,10 +1116,42 @@ def revoke_invite(
     body: RevokeInviteRequest,
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> dict[str, Any]:
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``_extract_token`` keeps the existing precedence).
+    # ``user`` only proves it was valid when the request arrived; the
+    # revocation must be authorized by the session state at the moment it
+    # takes effect inside the write transaction.
+    request_token = _extract_token(authorization, x_session_token)
+    if not request_token:  # defense in depth; current_user already 401s here
+        raise unauthorized()
+
     with transaction(conn):
-        m = require_membership(conn, user, org_id)
         ts = now_ts()
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this revocation against the logout /
+        # logout-others / password-change transactions (all writers): once
+        # this check reads the session as live and the transaction goes on to
+        # revoke the invite, no session revocation can commit in between; and
+        # if one committed first — or the expiry instant arrived
+        # (expires_at <= now) while the request was waiting — the revocation
+        # fails closed with 401. Another still-valid session of the same
+        # account cannot rescue this one: authorization is keyed to this
+        # token hash alone. Administrators and delegates follow the exact
+        # same rule, whether they authenticate via Bearer or X-Session-Token.
+        #
+        # This runs ahead of the membership/role check (403), the invite
+        # availability check (409), the delegate's active-delegation lookup
+        # (403) and the delegation sweep, so an invalid session is always
+        # answered 401 first and reveals nothing about the invite; and a 401
+        # here writes nothing — the invite keeps its status and revoked_at,
+        # no invite.revoked audit is stored, and no delegation is expired or
+        # invalidated by this request.
+        revalidate_session(conn, request_token, ts)
+        m = require_membership(conn, user, org_id)
         _sweep_delegations(conn, org_id, ts)
         inv = conn.execute(
             "SELECT * FROM invites WHERE org_id = ? AND token_hash = ?",
