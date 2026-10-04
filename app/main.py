@@ -1412,10 +1412,31 @@ def update_member(
         ).fetchone()
         return 200, {"membership": membership_dict(row)}
 
+    def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
+        # The request body carries only role/status, never the target: the
+        # target comes from the URL, so the body fingerprint alone cannot
+        # tell a replay against member A from a first attempt against member
+        # B with an identical body. Bind a successfully used key to the
+        # target of its first success: reusing it against a DIFFERENT member
+        # is an idempotency conflict even with the same body, and never
+        # returns the first member's stored info or adjusts the new target.
+        # A no-op adjustment (the member already had the requested state) is
+        # a successful key use too, so its key is bound just the same. The
+        # stored org_id is checked as well for defence in depth, although the
+        # scope already pins the organization.
+        resp = idempotency.replay_body(row)
+        stored = resp.get("membership") or {}
+        if stored.get("org_id") != org_id or stored.get("user_id") != target_user_id:
+            raise conflict(
+                "idempotency_conflict",
+                "Idempotency-Key was already used for a different target",
+            )
+
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
         check_perm=_check_perm,
         perform=_perform,
+        replay_check=_replay_check,
     )
     return resp
 

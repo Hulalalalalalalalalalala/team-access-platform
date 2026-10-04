@@ -16,6 +16,15 @@ A stored record captures the fingerprint of the request body and the first
 response without performing any new business change or audit write; a
 reused key with a different body is ``409 idempotency_conflict``.
 
+For operations whose target is not part of the body (single-member
+adjustment — body carries only role/status; member removal — no body), the
+caller additionally binds the key to the first successful target via a
+``replay_check``: reusing the key against another member — even with an
+identical body, and even when the new target is not a member of the org —
+is ``409 idempotency_conflict`` rather than a replay of the first member's
+response. A no-op success (target already in the requested state) binds the
+key just the same.
+
 Records are persisted, so replays remain valid after process restarts. The
 stored response may contain a single-use invite token, so the body column
 holds Fernet ciphertext (key file lives outside the database).
