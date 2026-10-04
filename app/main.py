@@ -909,12 +909,48 @@ def create_invite(
     user: CurrentUser = Depends(current_user),
     conn: sqlite3.Connection = Depends(get_conn),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=128),
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> dict[str, Any]:
+    # The one session actually carried by THIS request (Bearer or
+    # X-Session-Token; ``_extract_token`` keeps the existing precedence).
+    # ``user`` only proves it was valid when the request arrived; the
+    # issuance — and any idempotent replay — must be authorized by the
+    # session state at the moment it runs inside the write transaction.
+    request_token = _extract_token(authorization, x_session_token)
+    if not request_token:  # defense in depth; current_user already 401s here
+        raise unauthorized()
+
     # Delegation backing the current operation, captured by check_perm and
     # consumed by perform inside the SAME transaction (no race possible).
     backing: dict[str, Any] = {}
 
     def _check_perm(c: sqlite3.Connection) -> None:
+        # Re-validate the EXACT session this request carries, INSIDE the
+        # IMMEDIATE write transaction, before any other check. BEGIN
+        # IMMEDIATE serializes this issuance against the logout /
+        # logout-others / password-change transactions (all writers): once
+        # this check reads the session as live and the transaction goes on to
+        # issue the invite, no revocation can commit in between; and if a
+        # revocation committed first — or the expiry instant arrived
+        # (expires_at <= now) while the request was waiting — the issuance
+        # fails closed with 401. Another still-valid session of the same
+        # account cannot rescue this one: authorization is keyed to this
+        # token hash alone. Administrators and delegates follow the exact
+        # same rule, whether they authenticate via Bearer or X-Session-Token.
+        #
+        # This runs ahead of the membership/role check (403), the delegate's
+        # active-delegation lookup (403), the idempotency lookup
+        # (409 / stored replay) and every write, so an invalid session is
+        # always answered 401 first even when the caller lacks permission,
+        # the delegation is unusable, or the key already holds a success for
+        # a different request; and a 401 here inserts no invite, writes no
+        # invite.created audit, changes no delegation and stores no
+        # idempotency record — on first attempts (keyed or not) and on
+        # replays of a stored success alike (``_run_idempotent`` calls
+        # check_perm on every path before any replay is returned, and a
+        # rejected replay never rewrites the stored success).
+        revalidate_session(c, request_token, now_ts())
         m = require_membership(c, user, org_id)
         if m["role"] == "admin":
             # Administrators need no delegation.
