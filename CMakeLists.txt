@@ -13,3 +13,18 @@ else()
     pkg_check_modules(OPENSSL REQUIRED IMPORTED_TARGET openssl)
     target_link_libraries(sealmark PRIVATE PkgConfig::OPENSSL)
 endif()
+
+enable_testing()
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME digest
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_digest.py
+    )
+    set_tests_properties(
+        digest
+        PROPERTIES
+            ENVIRONMENT "SEALMARK_BIN=$<TARGET_FILE:sealmark>"
+    )
+endif()
