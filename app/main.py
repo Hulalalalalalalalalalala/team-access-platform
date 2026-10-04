@@ -949,8 +949,27 @@ def revoke_delegation(
             # Missing or belongs to another org: uniform 404.
             raise not_found("not_found", "delegation not found")
         if d["status"] != "active":
-            # Idempotent no-op: repeated revocation succeeds but writes no
-            # state change and no second audit row.
+            # Already revoked / expired / invalidated: return that state
+            # untouched. Repeated revocation succeeds but writes no state
+            # change and no second audit row; the stored reason, revoker and
+            # timestamps are history and are never rewritten here.
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return delegation_dict(row)
+        if d["expires_at"] <= ts:
+            # Expiry is judged at the moment revocation actually executes,
+            # not by the lazily-maintained status column (a list/issue call
+            # would have swept the row first; a direct revoke must reach the
+            # same answer). At or after expires_at the delegation has ALREADY
+            # expired, so an admin action cannot turn it into ``revoked``:
+            # record ``expired`` with no revoker/timestamp and no active-
+            # revocation or membership-invalidation audit. Identity fields
+            # and the original validity window are unchanged.
+            conn.execute(
+                "UPDATE delegations SET status = 'expired' WHERE id = ?",
+                (delegation_id,),
+            )
             row = conn.execute(
                 "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
             ).fetchone()

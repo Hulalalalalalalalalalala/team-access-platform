@@ -417,6 +417,160 @@ def test_delegate_cannot_revoke_delegation(api: Api):
     assert r.status_code == 403
 
 
+def _revoked_audit_count(db, org_id: int, delegation_id: int) -> int:
+    return db.execute(
+        "SELECT COUNT(*) AS n FROM audit_logs"
+        " WHERE org_id = ? AND action = 'delegation.revoked' AND target_id = ?",
+        (org_id, str(delegation_id)),
+    ).fetchone()["n"]
+
+
+def _any_invalidation_audit_count(db, org_id: int, delegation_id: int) -> int:
+    return db.execute(
+        "SELECT COUNT(*) AS n FROM audit_logs"
+        " WHERE org_id = ? AND action = 'delegation.invalidated' AND target_id = ?",
+        (org_id, str(delegation_id)),
+    ).fetchone()["n"]
+
+
+def test_revoke_expired_delegation_without_prior_list(api: Api, db):
+    """Direct revoke of an expired-but-unswept delegation yields expired.
+
+    The row still says ``active`` on disk (no list/issue call swept it); the
+    expiry decision is made at the moment revocation executes.
+    """
+    admin, org = _setup(api)
+    _, member_token, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+
+    # Expire on disk WITHOUT touching the list endpoint (no sweep yet).
+    db.execute("UPDATE delegations SET expires_at = 0 WHERE id = ?", (d["id"],))
+    db.commit()
+    assert db.execute("SELECT status FROM delegations WHERE id = ?",
+                      (d["id"],)).fetchone()["status"] == "active"
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                    token=admin)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["status"] == "expired"
+    assert out["revoked_by"] is None
+    assert out["revoked_at"] is None
+    # Identity and the original validity window are preserved.
+    assert out["id"] == d["id"]
+    assert out["grantor_id"] == d["grantor_id"]
+    assert out["delegate_id"] == d["delegate_id"]
+    assert out["starts_at"] == d["starts_at"]
+    assert out["expires_at"] == 0  # the original (forced) expiry instant
+
+    # Persisted as expired; no active-revocation / invalidation audit.
+    row = db.execute("SELECT * FROM delegations WHERE id = ?", (d["id"],)).fetchone()
+    assert row["status"] == "expired"
+    assert row["revoked_by"] is None and row["revoked_at"] is None
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+    assert _any_invalidation_audit_count(db, org["id"], d["id"]) == 0
+
+    # A repeat revoke keeps the same expired result and writes nothing.
+    r2 = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                     token=admin)
+    assert r2.status_code == 200 and r2.json()["status"] == "expired"
+    assert r2.json()["revoked_by"] is None
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+
+
+def test_revoke_expired_delegation_same_result_with_or_without_list(api: Api, db):
+    """Listing first then revoking reaches the identical result."""
+    admin, org = _setup(api)
+    _, member_token, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+    db.execute("UPDATE delegations SET expires_at = 0 WHERE id = ?", (d["id"],))
+    db.commit()
+
+    # The list sweep marks it expired; revoke must leave it expired.
+    lst = api.request("GET", f"/orgs/{org['id']}/delegations",
+                      token=admin).json()["delegations"]
+    assert next(x for x in lst if x["id"] == d["id"])["status"] == "expired"
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                    token=admin)
+    assert r.status_code == 200 and r.json()["status"] == "expired"
+    assert r.json()["revoked_by"] is None and r.json()["revoked_at"] is None
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+
+    # The delegate sees the same expired outcome afterwards.
+    m_lst = api.request("GET", f"/orgs/{org['id']}/delegations",
+                        token=member_token).json()["delegations"]
+    assert [x["id"] for x in m_lst] == [d["id"]]
+    assert m_lst[0]["status"] == "expired"
+    assert m_lst[0]["revoked_by"] is None
+
+
+def test_revoke_delegation_at_exact_expiry_instant(api: Api, db):
+    """At the expiry instant itself (expires_at == execution time) it is expired."""
+    admin, org = _setup(api)
+    _, _, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+
+    now = db.execute("SELECT strftime('%s', 'now') AS t").fetchone()["t"]
+    db.execute("UPDATE delegations SET expires_at = ? WHERE id = ?", (now, d["id"]))
+    db.commit()
+
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                    token=admin)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "expired"
+    assert r.json()["revoked_by"] is None and r.json()["revoked_at"] is None
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+
+
+def test_revoke_just_before_expiry_still_revokes(api: Api, db):
+    """An unexpired active delegation keeps the existing revoke behaviour."""
+    admin, org = _setup(api)
+    _, member_token, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+
+    # Pin the expiry one second into the future relative to the server clock.
+    now = int(db.execute("SELECT strftime('%s', 'now') AS t").fetchone()["t"])
+    db.execute("UPDATE delegations SET expires_at = ? WHERE id = ?",
+               (now + 60, d["id"]))
+    db.commit()
+
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                    token=admin)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["status"] == "revoked"
+    assert out["revoked_by"] is not None and out["revoked_at"] is not None
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 1
+
+    # The delegate loses invite power; issued invites are NOT revoked.
+    invitee, _ = api.new_user()
+    assert _issue(api, member_token, org["id"], invitee).status_code == 403
+
+
+def test_revoke_preserves_invalidated_history(api: Api, db):
+    """A membership-invalidated delegation keeps its reason/history on revoke."""
+    admin, org = _setup(api)
+    _, _, member_id = _add_member(api, admin, org["id"])
+    d = _grant(api, admin, org["id"], member_id).json()
+    api.request("PATCH", f"/orgs/{org['id']}/members/{member_id}", token=admin,
+                json={"status": "disabled"})
+
+    r = api.request("POST", f"/orgs/{org['id']}/delegations/{d['id']}/revoke",
+                    token=admin)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["status"] == "invalidated"
+    assert out["reason"] == "delegate_ineligible"
+    assert out["revoked_by"] is None
+    # No revoke audit is retroactively added.
+    assert _revoked_audit_count(db, org["id"], d["id"]) == 0
+    inv = db.execute("SELECT COUNT(*) AS n FROM audit_logs"
+                     " WHERE org_id = ? AND action = 'delegation.invalidated'"
+                     " AND target_id = ?", (org["id"], str(d["id"]))).fetchone()["n"]
+    assert inv == 1
+
+
 # ================================================================ invalidation
 
 def test_invalidation_grantor_demoted(api: Api):
