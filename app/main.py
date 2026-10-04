@@ -1412,10 +1412,29 @@ def update_member(
         ).fetchone()
         return 200, {"membership": membership_dict(row)}
 
+    def _replay_check(c: sqlite3.Connection, row: sqlite3.Row) -> None:
+        # The key binds not just to (operator, org, body) but to the TARGET
+        # member named in the path: the request body cannot distinguish a
+        # patch on member A from the identical patch on member B. A stored
+        # key replayed against a DIFFERENT member — even one outside this
+        # organization — is an idempotency conflict, never a second
+        # adjustment and never the first member's data. This runs before any
+        # target lookup, so it raises 409 without changing either member's
+        # role/status/updated_at, without invalidating a delegation and
+        # without an audit row; the stored success stays intact and a later
+        # replay against the original target still returns it.
+        resp = idempotency.replay_body(row)
+        stored = resp.get("membership") or {}
+        if stored.get("org_id") != org_id or stored.get("user_id") != target_user_id:
+            raise conflict(
+                "idempotency_conflict",
+                "Idempotency-Key was already used for a different target",
+            )
+
     _, resp = _run_idempotent(
         conn, user, idempotency.scope_member_update(org_id), idempotency_key, request_body,
         check_perm=_check_perm,
-        perform=_perform,
+        perform=_perform, replay_check=_replay_check,
     )
     return resp
 
