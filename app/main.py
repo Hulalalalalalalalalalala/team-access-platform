@@ -606,6 +606,16 @@ def _active_delegation(c: sqlite3.Connection, org_id: int, user_id: int, ts: int
     return d
 
 
+# The "active administrator" predicate, in ONE place: the delegation
+# eligibility rules below, the last-active-admin invariant of every
+# member-change entry point (single/batch PATCH and removal) all derive
+# from it, so the definition of an active admin is maintained once.
+# Role/status may be None when a membership row is missing (e.g. direct
+# on-disk manipulation, or a removed member) — that never qualifies.
+def _is_active_admin(role: Optional[str], status: Optional[str]) -> bool:
+    return role == "admin" and status == "active"
+
+
 # Eligibility rules behind a delegation, in ONE place. A delegation stays
 # effective only while its grantor is an ACTIVE administrator and its
 # delegate is an ACTIVE ordinary member of the same organization. Every
@@ -616,7 +626,7 @@ def _active_delegation(c: sqlite3.Connection, org_id: int, user_id: int, ts: int
 # (e.g. direct on-disk manipulation, or a removed member) — that never
 # qualifies.
 def _grantor_qualifies(role: Optional[str], status: Optional[str]) -> bool:
-    return role == "admin" and status == "active"
+    return _is_active_admin(role, status)
 
 
 def _delegate_qualifies(role: Optional[str], status: Optional[str]) -> bool:
@@ -1238,6 +1248,69 @@ def accept_invite(
 
 # ========================================================== member management
 
+# ------------------------------------------------------ shared adjustment rules
+# The single-member and batch adjustment entry points apply the SAME member
+# adjustment rules; they differ only in their public shape (one member vs an
+# ordered batch with a batch_id) and in how the last-active-admin invariant
+# is evaluated (per target vs over the whole finished batch). The rules
+# themselves live here once.
+
+
+def _resolve_member_adjustment(
+    current_role: str,
+    current_status: str,
+    role: Optional[str],
+    status: Optional[str],
+) -> tuple[str, str, bool]:
+    """Resolve one member adjustment against the current state.
+
+    A field left out of the request keeps its current value; a submitted
+    value identical to the current one is a no-op for that field.
+    ``changed`` is True only when the resolved state actually differs — a
+    fully identical submission still succeeds and returns the member, but
+    must not touch ``updated_at`` and must not write a change audit.
+    """
+    new_role = role or current_role
+    new_status = status or current_status
+    changed = new_role != current_role or new_status != current_status
+    return new_role, new_status, changed
+
+
+def _apply_member_adjustment(
+    c: sqlite3.Connection,
+    *,
+    org_id: int,
+    membership_id: Any,
+    before_role: str,
+    before_status: str,
+    new_role: str,
+    new_status: str,
+    actor_id: int,
+    ts: int,
+    batch_id: Optional[str] = None,
+) -> None:
+    """Apply ONE actual member change: row update plus its audit entry.
+
+    The membership write and the ``member.updated`` audit (operator, and the
+    role/status before and after) are recorded the same way for both entry
+    points, inside the caller's transaction — they commit or roll back with
+    everything else the entry point does. Only called for members that
+    ACTUALLY changed. The batch entry point passes its ``batch_id`` so the
+    audit joins the batch; the single-member entry point leaves it unset.
+    """
+    c.execute(
+        "UPDATE memberships SET role = ?, status = ?, updated_at = ? WHERE id = ?",
+        (new_role, new_status, ts, membership_id),
+    )
+    add_audit(
+        c, org_id=org_id, actor_id=actor_id, action="member.updated",
+        target_type="membership", target_id=membership_id,
+        before={"role": before_role, "status": before_status},
+        after={"role": new_role, "status": new_status},
+        batch_id=batch_id, ts=ts,
+    )
+
+
 @app.patch("/orgs/{org_id}/members/batch")
 def batch_update_members(
     org_id: int,
@@ -1300,7 +1373,9 @@ def batch_update_members(
     def _perform(c: sqlite3.Connection, ts: int) -> tuple[int, dict[str, Any]]:
         # Load every target first; a target outside THIS organization fails
         # the whole batch with 404 and reveals nothing about other orgs.
-        ordered: list[tuple[sqlite3.Row, str, str]] = []
+        # Each item's adjustment is resolved through the SAME shared rule
+        # the single-member entry point uses.
+        ordered: list[tuple[sqlite3.Row, str, str, bool]] = []
         for ch in body.changes:
             m = c.execute(
                 """
@@ -1311,9 +1386,10 @@ def batch_update_members(
             ).fetchone()
             if m is None:
                 raise not_found("member_not_found", "member not found")
-            new_role = ch.role or m["role"]
-            new_status = ch.status or m["status"]
-            ordered.append((m, new_role, new_status))
+            new_role, new_status, changed = _resolve_member_adjustment(
+                m["role"], m["status"], ch.role, ch.status
+            )
+            ordered.append((m, new_role, new_status, changed))
 
         # Order-independent last-active-admin invariant. Count active admins
         # that are untouched by the batch, then add targeted members whose
@@ -1325,10 +1401,10 @@ def batch_update_members(
             (org_id,),
         ).fetchone()["n"]
         targeted_active_admins = sum(
-            1 for m, _, _ in ordered if m["role"] == "admin" and m["status"] == "active"
+            1 for m, _, _, _ in ordered if _is_active_admin(m["role"], m["status"])
         )
         surviving_targeted = sum(
-            1 for _, nr, ns in ordered if nr == "admin" and ns == "active"
+            1 for _, nr, ns, _ in ordered if _is_active_admin(nr, ns)
         )
         untouched_admins = total_active_admins - targeted_active_admins
         if untouched_admins + surviving_targeted == 0:
@@ -1339,23 +1415,18 @@ def batch_update_members(
 
         batch_id = generate_batch_id()
         changed_states: dict[int, tuple[str, str]] = {}
-        for m, new_role, new_status in ordered:
-            before = {"role": m["role"], "status": m["status"]}
-            if new_role != m["role"] or new_status != m["status"]:
+        for m, new_role, new_status, changed in ordered:
+            if not changed:
                 # Unchanged members are returned but keep updated_at and get
                 # no audit row.
-                c.execute(
-                    "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
-                    " WHERE id = ?",
-                    (new_role, new_status, ts, m["id"]),
-                )
-                changed_states[m["user_id"]] = (new_role, new_status)
-                add_audit(
-                    c, org_id=org_id, actor_id=user.id, action="member.updated",
-                    target_type="membership", target_id=m["id"],
-                    before=before, after={"role": new_role, "status": new_status},
-                    batch_id=batch_id, ts=ts,
-                )
+                continue
+            _apply_member_adjustment(
+                c, org_id=org_id, membership_id=m["id"],
+                before_role=m["role"], before_status=m["status"],
+                new_role=new_role, new_status=new_status,
+                actor_id=user.id, ts=ts, batch_id=batch_id,
+            )
+            changed_states[m["user_id"]] = (new_role, new_status)
 
         # Delegation invalidation commits in the SAME transaction; one row
         # per affected active delegation even when both parties lose
@@ -1452,8 +1523,12 @@ def update_member(
         if m is None:
             raise not_found("member_not_found", "member not found")
 
-        new_role = body.role or m["role"]
-        new_status = body.status or m["status"]
+        # The SAME shared adjustment rule the batch entry point applies per
+        # item: unset fields keep their current value; identical values are
+        # a no-op.
+        new_role, new_status, changed = _resolve_member_adjustment(
+            m["role"], m["status"], body.role, body.status
+        )
 
         # Last-active-admin invariant (self-targeted operations included).
         # It applies to ANY change that turns the target from an active
@@ -1461,9 +1536,7 @@ def update_member(
         # demotion, disabling, or both at once. The count excludes the
         # target, and the IMMEDIATE write lock serializes concurrent
         # demotions/disables so they cannot both pass this check.
-        is_active_admin_now = m["role"] == "admin" and m["status"] == "active"
-        is_active_admin_after = new_role == "admin" and new_status == "active"
-        if is_active_admin_now and not is_active_admin_after:
+        if _is_active_admin(m["role"], m["status"]) and not _is_active_admin(new_role, new_status):
             other_active_admins = c.execute(
                 "SELECT COUNT(*) AS n FROM memberships"
                 " WHERE org_id = ? AND role = 'admin' AND status = 'active'"
@@ -1476,18 +1549,12 @@ def update_member(
                     "organization must retain at least one active administrator",
                 )
 
-        before = {"role": m["role"], "status": m["status"]}
-        changed = new_role != m["role"] or new_status != m["status"]
         if changed:
-            c.execute(
-                "UPDATE memberships SET role = ?, status = ?, updated_at = ?"
-                " WHERE id = ?",
-                (new_role, new_status, ts, m["id"]),
-            )
-            add_audit(
-                c, org_id=org_id, actor_id=user.id, action="member.updated",
-                target_type="membership", target_id=m["id"],
-                before=before, after={"role": new_role, "status": new_status}, ts=ts,
+            _apply_member_adjustment(
+                c, org_id=org_id, membership_id=m["id"],
+                before_role=m["role"], before_status=m["status"],
+                new_role=new_role, new_status=new_status,
+                actor_id=user.id, ts=ts,
             )
             # Member change invalidates affected delegations in the SAME
             # transaction; the change and the invalidation audit commit or
@@ -1611,7 +1678,7 @@ def remove_member(
         # A DISABLED admin does not count toward the quota, so removing one
         # never trips this check; BEGIN IMMEDIATE serializes concurrent
         # removals/adjustments so zero active admins is impossible.
-        if m["role"] == "admin" and m["status"] == "active":
+        if _is_active_admin(m["role"], m["status"]):
             other_active_admins = c.execute(
                 "SELECT COUNT(*) AS n FROM memberships"
                 " WHERE org_id = ? AND role = 'admin' AND status = 'active'"
