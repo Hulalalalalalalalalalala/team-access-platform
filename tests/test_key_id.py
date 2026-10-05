@@ -28,6 +28,16 @@ The key-id contract under test (see README):
   truncation leaving a marker or the base64 body unfinished at a read
   boundary, private keys, certificates and other public-key wrappers (e.g.
   PKCS#1 ``RSA PUBLIC KEY``) all fail;
+* an intact PEM envelope (correct markers, legal base64, complete outer
+  structure) is not enough: the decoded payload must be canonical
+  SubjectPublicKeyInfo DER, not merely BER the crypto library can parse.
+  Non-minimal length-of-length encodings, RSA INTEGERs with surplus leading
+  zero bytes, and fields whose declared length does not match their content
+  are rejected even when the bytes still describe the original key -- the
+  command never normalizes such input to a canonical re-encoding and never
+  prints a fingerprint for it. The one apparent oddity that IS canonical --
+  an RSA modulus' mandatory leading zero when its top bit is set -- stays
+  accepted;
 * missing path / directory / unreadable input / invalid key content: exit
   code 1 with empty stdout and a stderr message containing the path -- the
   command never falls back to a file digest and never prints a partial
@@ -109,6 +119,99 @@ def wrap_public_pem(der, width=64, newline=b"\n", final_newline=True,
     return out
 
 
+# --- Minimal DER builders for the internal-encoding tests ------------------
+#
+# key-id must fingerprint exactly the canonical SubjectPublicKeyInfo DER and
+# reject payloads whose PEM envelope is intact but whose inner encoding is
+# not canonical DER -- even when those bytes still describe the same key.
+# These builders compose an SPKI from its parts so a test can disturb one
+# length field or INTEGER content at a time while keeping every other level
+# canonical; the undisturbed output is pinned against the cryptography
+# package's own encoding in the tests below.
+
+RSA_ALGORITHM_OID = bytes.fromhex("2a864886f70d010101")  # rsaEncryption
+ED25519_ALGORITHM_OID = bytes.fromhex("2b6570")  # Ed25519
+
+
+def der_length(length, force_long_form=False, extra_length_bytes=0):
+    """Encode a DER length, optionally in a non-minimal (non-DER) form."""
+    if not force_long_form and not extra_length_bytes and length < 0x80:
+        return bytes([length])
+    raw = length.to_bytes(max(1, (length.bit_length() + 7) // 8), "big")
+    raw = b"\x00" * extra_length_bytes + raw
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def der_tlv(tag, content, declared_length=None, **length_kwargs):
+    length = len(content) if declared_length is None else declared_length
+    return bytes([tag]) + der_length(length, **length_kwargs) + content
+
+
+def der_content(encoded):
+    """Return the content bytes of a single DER TLV (canonical lengths)."""
+    first = encoded[1]
+    if first < 0x80:
+        header, length = 2, first
+    else:
+        count = first & 0x7F
+        header = 2 + count
+        length = int.from_bytes(encoded[2:header], "big")
+    assert length == len(encoded) - header, "not one complete DER TLV"
+    return encoded[header:]
+
+
+def der_integer_content(value):
+    """Canonical DER INTEGER content for a non-negative value: two's
+    complement, so a leading 0x00 is present exactly when the value's top
+    bit is set (without it the integer would decode as negative)."""
+    raw = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+    return (b"\x00" if raw[0] >= 0x80 else b"") + raw
+
+
+def build_rsa_spki_der(modulus_content, exponent_content, *,
+                       outer=None, algid=None, bit_string=None,
+                       inner=None, modulus=None, exponent=None,
+                       declared_delta=None):
+    """Build an RSA SPKI DER from the two INTEGER contents. Each level
+    keyword overrides the der_tlv kwargs of that nesting level; a
+    (level, delta) ``declared_delta`` makes that level's declared length
+    differ from its actual content length."""
+    level, delta = declared_delta or (None, 0)
+
+    def tlv(tag, content, level_name, kwargs):
+        kwargs = dict(kwargs or {})
+        if level_name == level:
+            kwargs["declared_length"] = len(content) + delta
+        return der_tlv(tag, content, **kwargs)
+
+    modulus_tlv = tlv(0x02, modulus_content, "modulus", modulus)
+    exponent_tlv = tlv(0x02, exponent_content, "exponent", exponent)
+    inner_tlv = tlv(0x30, modulus_tlv + exponent_tlv, "inner", inner)
+    algid_tlv = tlv(
+        0x30, der_tlv(0x06, RSA_ALGORITHM_OID) + der_tlv(0x05, b""),
+        "algid", algid,
+    )
+    bit_string_tlv = tlv(0x03, b"\x00" + inner_tlv, "bit_string", bit_string)
+    return tlv(0x30, algid_tlv + bit_string_tlv, "outer", outer)
+
+
+def build_ed25519_spki_der(raw_key, *, outer=None, algid=None,
+                           bit_string=None, declared_delta=None):
+    """Build an Ed25519 SPKI DER from the raw 32-byte public key; the
+    keywords work as in build_rsa_spki_der."""
+    level, delta = declared_delta or (None, 0)
+
+    def tlv(tag, content, level_name, kwargs):
+        kwargs = dict(kwargs or {})
+        if level_name == level:
+            kwargs["declared_length"] = len(content) + delta
+        return der_tlv(tag, content, **kwargs)
+
+    algid_tlv = tlv(0x30, der_tlv(0x06, ED25519_ALGORITHM_OID), "algid", algid)
+    bit_string_tlv = tlv(0x03, b"\x00" + raw_key, "bit_string", bit_string)
+    return tlv(0x30, algid_tlv + bit_string_tlv, "outer", outer)
+
+
 # Every ASCII whitespace byte accepted around the PEM block (must match
 # isAsciiSpace in src/main.cpp): space, tab, LF, vertical tab, form feed, CR.
 AROUND_BLOCK_WHITESPACE = b" \t\n\x0b\x0c\r"
@@ -154,6 +257,28 @@ class SealmarkKeyIdTest(unittest.TestCase):
 
         cls.ec_priv = ec.generate_private_key(ec.SECP256R1())
         cls.ec_der = spki_der(cls.ec_priv.public_key())
+
+        # An RSA key whose modulus has its most significant bit set, so the
+        # canonical DER INTEGER content carries the mandatory leading 0x00
+        # (without it the integer would decode as negative). Each generated
+        # key has a good chance of qualifying; regenerate until one does.
+        hi_priv = rsa.generate_private_key(public_exponent=65537,
+                                           key_size=2048)
+        while hi_priv.public_key().public_numbers().n.bit_length() < 2048:
+            hi_priv = rsa.generate_private_key(public_exponent=65537,
+                                               key_size=2048)
+        cls.rsa_hi_pub = hi_priv.public_key()
+        cls.rsa_hi_der = spki_der(cls.rsa_hi_pub)
+        cls.rsa_hi_modulus_content = der_integer_content(
+            cls.rsa_hi_pub.public_numbers().n
+        )
+        cls.rsa_hi_exponent_content = der_integer_content(
+            cls.rsa_hi_pub.public_numbers().e
+        )
+
+        cls.ed_raw = cls.ed_pub.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="sealmark-keyid-test-"))
@@ -904,6 +1029,195 @@ class SealmarkKeyIdTest(unittest.TestCase):
         content = wrap_public_pem(broken_der)
         path = self.write_file("trailing-der.pub", content)
         self.assertRejected(self.run_key_id(str(path)), path)
+
+    # -- internal DER encoding (canonical SPKI only) -----------------------
+    #
+    # An intact PEM envelope -- correct PUBLIC KEY markers, legal base64, a
+    # complete outer structure -- says nothing about whether the decoded
+    # payload is canonical DER. The tests below pin that key-id rejects
+    # non-canonical internal encodings (exit 1, empty stdout, stderr naming
+    # the path) instead of normalizing them to a canonical re-encoding and
+    # printing a fingerprint, while still accepting the one apparent oddity
+    # DER itself requires: an RSA modulus' mandatory leading zero.
+
+    def test_der_builders_reproduce_canonical_library_encoding(self):
+        # Sanity for every internal-encoding test below: undisturbed, the
+        # builders emit exactly the cryptography package's canonical DER,
+        # and key-id accepts those hand-assembled bytes with the same
+        # fingerprint as the library-produced PEM.
+        self.assertEqual(self.rsa_hi_modulus_content[0], 0x00)
+        self.assertGreaterEqual(self.rsa_hi_modulus_content[1], 0x80)
+        rebuilt_rsa = build_rsa_spki_der(
+            self.rsa_hi_modulus_content, self.rsa_hi_exponent_content
+        )
+        self.assertEqual(rebuilt_rsa, self.rsa_hi_der)
+        rebuilt_ed = build_ed25519_spki_der(self.ed_raw)
+        self.assertEqual(rebuilt_ed, self.ed_der)
+        for name, der in (("rsa", rebuilt_rsa), ("ed25519", rebuilt_ed)):
+            with self.subTest(name=name):
+                path = self.write_file(
+                    f"internal/rebuilt/{name}.pub", wrap_public_pem(der)
+                )
+                self.assertFingerprintOk(self.run_key_id(str(path)), der)
+
+    def test_mandatory_leading_zero_modulus_is_accepted(self):
+        # The flip side of rejecting surplus leading zeros: an RSA modulus
+        # whose top bit is set MUST keep its 0x00 prefix -- that is the
+        # canonical encoding, not an anomaly to be stripped. The fingerprint
+        # is the SHA-256 of that exact DER under every legal PEM layout.
+        expected = fingerprint_of_der(self.rsa_hi_der)
+        variants = {
+            "lf64.pub": wrap_public_pem(self.rsa_hi_der, 64, b"\n"),
+            "crlf64.pub": wrap_public_pem(self.rsa_hi_der, 64, b"\r\n"),
+            "lf17.pub": wrap_public_pem(self.rsa_hi_der, 17, b"\n"),
+            "no-final-newline.pub": wrap_public_pem(
+                self.rsa_hi_der, 64, b"\n", final_newline=False
+            ),
+        }
+        for name, content in variants.items():
+            with self.subTest(name=name):
+                path = self.write_file(Path("internal/leading-zero", name),
+                                       content)
+                result = self.run_key_id(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    result.stdout, (expected + "\n").encode("ascii")
+                )
+
+    def test_non_minimal_length_encodings_are_rejected(self):
+        # Every length here still frames the same content bytes -- the key
+        # material is untouched -- but the length-of-length is not the
+        # shortest form DER requires. Re-encoding canonically and
+        # fingerprinting the result is exactly what must NOT happen.
+        mc, ec = self.rsa_hi_modulus_content, self.rsa_hi_exponent_content
+        long_form = {"force_long_form": True}
+        padded = {"extra_length_bytes": 1}
+        variants = {
+            # Canonically short-form lengths forced into long form.
+            "rsa-algid-long-form":
+                build_rsa_spki_der(mc, ec, algid=long_form),
+            "rsa-exponent-long-form":
+                build_rsa_spki_der(mc, ec, exponent=long_form),
+            # Already long-form lengths with a superfluous zero length byte.
+            "rsa-outer-padded-length":
+                build_rsa_spki_der(mc, ec, outer=padded),
+            "rsa-bit-string-padded-length":
+                build_rsa_spki_der(mc, ec, bit_string=padded),
+            "rsa-inner-padded-length":
+                build_rsa_spki_der(mc, ec, inner=padded),
+            "rsa-modulus-padded-length":
+                build_rsa_spki_der(mc, ec, modulus=padded),
+            # Every Ed25519 SPKI length is canonically short-form.
+            "ed25519-outer-long-form":
+                build_ed25519_spki_der(self.ed_raw, outer=long_form),
+            "ed25519-algid-long-form":
+                build_ed25519_spki_der(self.ed_raw, algid=long_form),
+            "ed25519-bit-string-long-form":
+                build_ed25519_spki_der(self.ed_raw, bit_string=long_form),
+            "ed25519-outer-padded-length":
+                build_ed25519_spki_der(self.ed_raw, outer=padded),
+            # BER indefinite-length outer SEQUENCE terminated by an EOC.
+            "rsa-outer-indefinite":
+                b"\x30\x80" + der_content(build_rsa_spki_der(mc, ec))
+                + b"\x00\x00",
+            "ed25519-outer-indefinite":
+                b"\x30\x80" + der_content(self.ed_der) + b"\x00\x00",
+        }
+        for name, der in variants.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(der, self.rsa_hi_der)
+                self.assertNotEqual(der, self.ed_der)
+                path = self.write_file(f"internal/length/{name}.pub",
+                                       wrap_public_pem(der))
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_rsa_integer_extra_leading_zeros_are_rejected(self):
+        # Surplus 0x00 prefixes on the modulus or exponent INTEGER: the
+        # encoded integer value is unchanged (stripping the surplus bytes
+        # recovers the canonical content exactly), but the encoding is not
+        # DER and must be rejected, not normalized.
+        mc, ec = self.rsa_hi_modulus_content, self.rsa_hi_exponent_content
+        variants = {
+            "modulus-one-extra-zero": build_rsa_spki_der(b"\x00" + mc, ec),
+            "modulus-two-extra-zeros":
+                build_rsa_spki_der(b"\x00\x00" + mc, ec),
+            "exponent-one-extra-zero": build_rsa_spki_der(mc, b"\x00" + ec),
+        }
+        for name, der in variants.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(der, self.rsa_hi_der)
+                path = self.write_file(f"internal/int-zero/{name}.pub",
+                                       wrap_public_pem(der))
+                before = path.read_bytes()
+                result = self.run_key_id(str(path))
+                self.assertRejected(result, path)
+                # Rejection is read-only: the input file is never rewritten
+                # to a canonical encoding (or anything else).
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_rsa_modulus_missing_mandatory_leading_zero_is_rejected(self):
+        # Dropping the 0x00 from a top-bit-set modulus does not yield a
+        # shorter encoding of the same key -- it makes the INTEGER negative.
+        # This must not be "repaired" back into the canonical key either.
+        truncated = self.rsa_hi_modulus_content[1:]
+        self.assertGreaterEqual(truncated[0], 0x80)
+        der = build_rsa_spki_der(truncated, self.rsa_hi_exponent_content)
+        self.assertNotEqual(der, self.rsa_hi_der)
+        path = self.write_file("internal/negative-modulus.pub",
+                               wrap_public_pem(der))
+        self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_declared_length_mismatching_content_is_rejected(self):
+        # The outer SEQUENCE and the PEM envelope stay complete and
+        # well-formed, but one inner field declares a length that does not
+        # match its actual content. A parser that trusts the outer wrapper
+        # alone would accept these; key-id must not.
+        mc, ec = self.rsa_hi_modulus_content, self.rsa_hi_exponent_content
+        variants = {
+            "rsa-outer-declares-one-extra":
+                build_rsa_spki_der(mc, ec, declared_delta=("outer", 1)),
+            "rsa-outer-declares-one-less":
+                build_rsa_spki_der(mc, ec, declared_delta=("outer", -1)),
+            "rsa-bit-string-declares-one-extra":
+                build_rsa_spki_der(mc, ec, declared_delta=("bit_string", 1)),
+            "rsa-bit-string-declares-one-less":
+                build_rsa_spki_der(mc, ec, declared_delta=("bit_string", -1)),
+            "rsa-inner-declares-one-extra":
+                build_rsa_spki_der(mc, ec, declared_delta=("inner", 1)),
+            "rsa-inner-declares-one-less":
+                build_rsa_spki_der(mc, ec, declared_delta=("inner", -1)),
+            "rsa-modulus-declares-one-extra":
+                build_rsa_spki_der(mc, ec, declared_delta=("modulus", 1)),
+            "rsa-modulus-declares-one-less":
+                build_rsa_spki_der(mc, ec, declared_delta=("modulus", -1)),
+            "rsa-algid-declares-one-extra":
+                build_rsa_spki_der(mc, ec, declared_delta=("algid", 1)),
+            "rsa-algid-declares-one-less":
+                build_rsa_spki_der(mc, ec, declared_delta=("algid", -1)),
+            "ed25519-outer-declares-one-extra":
+                build_ed25519_spki_der(self.ed_raw,
+                                       declared_delta=("outer", 1)),
+            "ed25519-outer-declares-one-less":
+                build_ed25519_spki_der(self.ed_raw,
+                                       declared_delta=("outer", -1)),
+            "ed25519-bit-string-declares-one-extra":
+                build_ed25519_spki_der(self.ed_raw,
+                                       declared_delta=("bit_string", 1)),
+            "ed25519-bit-string-declares-one-less":
+                build_ed25519_spki_der(self.ed_raw,
+                                       declared_delta=("bit_string", -1)),
+            "ed25519-algid-declares-one-extra":
+                build_ed25519_spki_der(self.ed_raw,
+                                       declared_delta=("algid", 1)),
+        }
+        for name, der in variants.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(der, self.rsa_hi_der)
+                self.assertNotEqual(der, self.ed_der)
+                path = self.write_file(f"internal/mismatch/{name}.pub",
+                                       wrap_public_pem(der))
+                self.assertRejected(self.run_key_id(str(path)), path)
 
     # -- file failures (exit code 1) -------------------------------------
 
