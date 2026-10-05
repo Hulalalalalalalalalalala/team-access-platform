@@ -26,7 +26,12 @@ The key-id contract under test (see README):
   command never falls back to a file digest and never prints a partial
   fingerprint;
 * missing/empty/extra arguments: exit code 2, empty stdout, usage text on
-  stderr mentioning ``key-id``.
+  stderr mentioning ``key-id``;
+* the file is consumed in fixed-size read passes (CHUNK_SIZE bytes): legal
+  ASCII whitespace that pushes the block across pass boundaries, BEGIN/END
+  markers, base64 lines and CRLF pairs split between two passes, an END
+  marker ending exactly at end of file, distant trailing junk behind large
+  whitespace, and truncation landing on a pass boundary are all covered.
 
 The read-failure cases reuse the LD_PRELOAD fault injector shared with the
 other suites ($SEALMARK_READFAIL_PRELOAD): a regular file opens fine and
@@ -100,6 +105,12 @@ def wrap_public_pem(der, width=64, newline=b"\n", final_newline=True,
     if final_newline:
         out += newline
     return out
+
+
+def ascii_whitespace(length):
+    """A deterministic mix of every permitted ASCII whitespace byte."""
+    cycle = b" \t\r\n\x0b\x0c"
+    return (cycle * (length // len(cycle) + 1))[:length]
 
 
 class SealmarkKeyIdTest(unittest.TestCase):
@@ -533,6 +544,216 @@ class SealmarkKeyIdTest(unittest.TestCase):
         content = wrap_public_pem(broken_der)
         path = self.write_file("trailing-der.pub", content)
         self.assertRejected(self.run_key_id(str(path)), path)
+
+    # -- multi-read (chunk-boundary) coverage ------------------------------
+    #
+    # The file is read in CHUNK_SIZE-byte passes. These tests pin the
+    # behaviour of inputs whose PEM block, surrounding whitespace or
+    # trailing content crosses one or more read boundaries: legal layout
+    # must not change the fingerprint no matter where a pass boundary
+    # falls, and the whole-file validity check must extend to the very
+    # last read rather than stopping at the first complete key.
+
+    def test_large_whitespace_around_block_spanning_reads_same_fingerprint(self):
+        keys = {
+            "rsa": (self.rsa_der, self.rsa_pem),
+            "ed25519": (self.ed_der, self.ed_pem),
+        }
+        for key_name, (der, pem) in keys.items():
+            expected = (fingerprint_of_der(der) + "\n").encode("ascii")
+            variants = {
+                "before": ascii_whitespace(3 * CHUNK_SIZE + 7) + pem,
+                "after": pem + ascii_whitespace(2 * CHUNK_SIZE + 13),
+                "both": (ascii_whitespace(CHUNK_SIZE + 1) + pem +
+                         ascii_whitespace(CHUNK_SIZE - 1)),
+            }
+            for variant, content in variants.items():
+                with self.subTest(key=key_name, variant=variant):
+                    self.assertGreater(len(content), CHUNK_SIZE)
+                    path = self.write_file(
+                        f"multi-ws/{key_name}-{variant}.pub", content
+                    )
+                    result = self.run_key_id(str(path))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, expected)
+
+    def test_pem_structure_split_across_read_boundary_same_fingerprint(self):
+        pem = self.rsa_pem
+        end_at = pem.index(END)
+        # Each offset is placed exactly on a read boundary, so the bytes
+        # before it and from it onward arrive in different read passes.
+        offsets = {
+            "begin-start": 1,
+            "begin-mid": len(BEGIN) // 2,
+            "begin-last": len(BEGIN) - 1,
+            "begin-line-feed": len(BEGIN),
+            "first-payload-byte": len(BEGIN) + 1,
+            "payload-mid": (len(BEGIN) + end_at) // 2,
+            "payload-line-feed": pem.index(b"\n", len(BEGIN) + 2),
+            "end-start": end_at + 1,
+            "end-mid": end_at + len(END) // 2,
+            "end-last": end_at + len(END) - 1,
+            "final-newline": len(pem) - 1,
+        }
+        expected = (fingerprint_of_der(self.rsa_der) + "\n").encode("ascii")
+        for name, off in offsets.items():
+            for target in (CHUNK_SIZE, 2 * CHUNK_SIZE):
+                with self.subTest(name=name, target=target):
+                    content = ascii_whitespace(target - off) + pem
+                    self.assertGreater(len(content), target)
+                    path = self.write_file(
+                        f"split/{target}-{name}.pub", content
+                    )
+                    result = self.run_key_id(str(path))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, expected)
+
+    def test_crlf_pair_split_across_read_boundary_same_fingerprint(self):
+        pem = self.rsa_pem.replace(b"\n", b"\r\n")
+        # Offsets of the LF byte of CRLF pairs: the CR then arrives at the
+        # end of one read pass and the LF at the start of the next.
+        header_lf = pem.index(b"\r\n") + 1
+        payload_lf = pem.index(b"\r\n", header_lf + 1) + 1
+        end_line_lf = pem.rindex(b"\r\n") + 1
+        offsets = {
+            "header-crlf": header_lf,
+            "payload-crlf": payload_lf,
+            "end-line-crlf": end_line_lf,
+            "begin-mid": len(BEGIN) // 2,
+            "end-mid": pem.index(END) + len(END) // 2,
+        }
+        expected = (fingerprint_of_der(self.rsa_der) + "\n").encode("ascii")
+        for name, off in offsets.items():
+            with self.subTest(name=name):
+                content = ascii_whitespace(CHUNK_SIZE - off) + pem
+                self.assertGreater(len(content), CHUNK_SIZE)
+                path = self.write_file(f"split-crlf/{name}.pub", content)
+                result = self.run_key_id(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(result.stdout, expected)
+
+    def test_base64_rewrapping_with_large_whitespace_same_fingerprint(self):
+        encoded_len = len(base64.b64encode(self.rsa_der))
+        variants = [
+            wrap_public_pem(self.rsa_der, 1, b"\n"),
+            wrap_public_pem(self.rsa_der, 4, b"\r\n"),
+            wrap_public_pem(self.rsa_der, 63, b"\n"),
+            wrap_public_pem(self.rsa_der, 64, b"\n"),
+            wrap_public_pem(self.rsa_der, 65, b"\r\n"),
+            wrap_public_pem(self.rsa_der, encoded_len, b"\n"),
+        ]
+        expected = (fingerprint_of_der(self.rsa_der) + "\n").encode("ascii")
+        outputs = set()
+        for i, pem in enumerate(variants):
+            with self.subTest(variant=i):
+                content = (ascii_whitespace(CHUNK_SIZE + 3 * i) + pem +
+                           ascii_whitespace(CHUNK_SIZE + 5))
+                self.assertGreater(len(content), 2 * CHUNK_SIZE)
+                path = self.write_file(f"rewrap/{i}.pub", content)
+                result = self.run_key_id(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(result.stdout, expected)
+                outputs.add(result.stdout)
+        self.assertEqual(outputs, {expected})
+
+    def test_content_beyond_large_trailing_whitespace_is_rejected(self):
+        gap = ascii_whitespace(2 * CHUNK_SIZE + 5)
+        cases = {
+            # A second key (or any other content) far behind the first one
+            # must reject the whole file; the first key's fingerprint may
+            # never be printed before the rest is checked.
+            "second-key": self.rsa_pem + gap + self.ed_pem,
+            "same-key-twice": self.rsa_pem + gap + self.rsa_pem,
+            "begin-marker": self.rsa_pem + gap + BEGIN + b"\n",
+            "non-ws-byte": self.rsa_pem + gap + b"x",
+            "non-ascii-byte": self.rsa_pem + gap + b"\xff",
+            "junk-before": b"x" + gap + self.rsa_pem,
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                self.assertGreater(len(content), 2 * CHUNK_SIZE)
+                path = self.write_file(f"distant/{name}.pub", content)
+                result = self.run_key_id(str(path))
+                self.assertRejected(result, path)
+                self.assertIn(b"valid", result.stderr)
+
+    def test_whitespace_only_file_spanning_reads_is_rejected(self):
+        path = self.write_file(
+            "ws-only.pub", ascii_whitespace(2 * CHUNK_SIZE + 3)
+        )
+        self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_truncation_at_read_boundary_is_rejected(self):
+        pem = self.rsa_pem
+        end_at = pem.index(END)
+        # Each cut leaves the file ending mid-structure exactly on a read
+        # boundary: inside BEGIN, right after the BEGIN line, mid base64,
+        # or inside END.
+        cuts = {
+            "inside-begin": len(BEGIN) // 2,
+            "begin-almost-complete": len(BEGIN) - 1,
+            "after-begin-line": len(BEGIN) + 1,
+            "mid-payload": (len(BEGIN) + end_at) // 2,
+            "payload-near-end": end_at - 2,
+            "inside-end": end_at + len(END) // 2,
+            "end-almost-complete": end_at + len(END) - 1,
+        }
+        for name, cut in cuts.items():
+            for target in (CHUNK_SIZE, 2 * CHUNK_SIZE):
+                with self.subTest(name=name, target=target):
+                    content = ascii_whitespace(target - cut) + pem[:cut]
+                    self.assertEqual(len(content), target)
+                    path = self.write_file(f"cut/{target}-{name}.pub", content)
+                    self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_end_marker_at_eof_without_newline_is_valid(self):
+        pems = {
+            "lf": wrap_public_pem(self.rsa_der, 64, b"\n",
+                                  final_newline=False),
+            "crlf": wrap_public_pem(self.rsa_der, 64, b"\r\n",
+                                    final_newline=False),
+        }
+        expected = (fingerprint_of_der(self.rsa_der) + "\n").encode("ascii")
+        for name, pem in pems.items():
+            # The END marker's last byte is the file's last byte, exactly on
+            # and around read boundaries; no trailing newline needed.
+            for target in (CHUNK_SIZE, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 17):
+                with self.subTest(name=name, target=target):
+                    content = ascii_whitespace(target - len(pem)) + pem
+                    self.assertEqual(len(content), target)
+                    path = self.write_file(f"eof/{name}-{target}.pub", content)
+                    result = self.run_key_id(str(path))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, expected)
+
+    def test_end_at_eof_and_newline_plus_whitespace_same_fingerprint(self):
+        bare = wrap_public_pem(self.ed_der, 64, b"\n", final_newline=False)
+        prefix = ascii_whitespace(CHUNK_SIZE - len(bare))
+        # END's last byte lands exactly at the first read boundary...
+        at_eof = prefix + bare
+        # ...and the same key with a legal final newline plus a further
+        # read's worth of trailing whitespace.
+        with_tail = prefix + bare + b"\n" + ascii_whitespace(CHUNK_SIZE)
+        self.assertEqual(len(at_eof), CHUNK_SIZE)
+
+        p1 = self.write_file("eof/bare.pub", at_eof)
+        p2 = self.write_file("eof/with-tail.pub", with_tail)
+        r1 = self.run_key_id(str(p1))
+        r2 = self.run_key_id(str(p2))
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(r1.stderr, b"")
+        self.assertEqual(r2.stderr, b"")
+        self.assertEqual(r1.stdout, r2.stdout)
+        self.assertEqual(
+            r1.stdout,
+            (fingerprint_of_der(self.ed_der) + "\n").encode("ascii"),
+        )
 
     # -- file failures (exit code 1) -------------------------------------
 
