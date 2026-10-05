@@ -60,4 +60,13 @@ if(Python3_Interpreter_FOUND)
         PROPERTIES
         ENVIRONMENT "${SEALMARK_TEST_ENV}"
     )
+    add_test(
+        NAME key-id
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_key_id.py
+    )
+    set_tests_properties(
+        key-id
+        PROPERTIES
+        ENVIRONMENT "${SEALMARK_TEST_ENV}"
+    )
 endif()
