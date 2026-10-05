@@ -12,15 +12,20 @@ The key-id contract under test (see README):
   (EC P-256 is covered as well);
 * the same key produces the same fingerprint under LF or CRLF line endings,
   any legal base64 line wrapping, no trailing newline, and after the file is
-  moved or renamed;
+  moved or renamed -- even when large amounts of surrounding ASCII whitespace
+  carry the block through several 64 KiB read passes, with the begin marker,
+  base64 data, end marker and the two bytes of each CRLF straddling read
+  boundaries;
 * the fingerprint is independently recomputed here with hashlib over the DER
   obtained from the cryptography package, and one Ed25519 case is pinned to a
   known answer;
 * the file must contain exactly one PEM block wrapped in the literal
   ``PUBLIC KEY`` label, with only ASCII whitespace before or after it. Empty
   files, damaged/truncated encodings, non-canonical base64, more than one key,
-  stray non-whitespace bytes, private keys, certificates and other public-key
-  wrappers (e.g. PKCS#1 ``RSA PUBLIC KEY``) all fail;
+  stray non-whitespace bytes (even several read passes beyond the block),
+  truncation leaving a marker or the base64 body unfinished at a read
+  boundary, private keys, certificates and other public-key wrappers (e.g.
+  PKCS#1 ``RSA PUBLIC KEY``) all fail;
 * missing path / directory / unreadable input / invalid key content: exit
   code 1 with empty stdout and a stderr message containing the path -- the
   command never falls back to a file digest and never prints a partial
@@ -100,6 +105,19 @@ def wrap_public_pem(der, width=64, newline=b"\n", final_newline=True,
     if final_newline:
         out += newline
     return out
+
+
+# Every ASCII whitespace byte accepted around the PEM block (must match
+# isAsciiSpace in src/main.cpp): space, tab, LF, vertical tab, form feed, CR.
+AROUND_BLOCK_WHITESPACE = b" \t\n\x0b\x0c\r"
+
+
+def ascii_whitespace(length):
+    """Build a `length`-byte run using all six legal surrounding whitespace
+    bytes, cycling deterministically (no randomness so a failing offset is
+    reproducible)."""
+    pattern = AROUND_BLOCK_WHITESPACE
+    return pattern * (length // len(pattern)) + pattern[:length % len(pattern)]
 
 
 class SealmarkKeyIdTest(unittest.TestCase):
@@ -310,6 +328,265 @@ class SealmarkKeyIdTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(path.read_bytes(), content_before)
         self.assertEqual(path.stat().st_size, before.st_size)
+
+    # -- multiple read passes / chunk-boundary regression ----------------
+    #
+    # The file is delivered to the parser in fixed CHUNK_SIZE-byte passes, so
+    # every parser state must survive a boundary between passes. A PEM block
+    # is short, so surrounding ASCII whitespace is used to push individual
+    # block bytes across those boundaries; the padding itself never enters the
+    # fingerprint. These tests pin that behavior for both RSA and Ed25519.
+
+    def _assert_fingerprint_for_content(self, content, der, name):
+        self.assertGreater(
+            len(content), CHUNK_SIZE,
+            "test setup must force more than one read pass",
+        )
+        path = self.write_file(name, content)
+        self.assertFingerprintOk(self.run_key_id(str(path)), der)
+
+    def test_large_whitespace_padding_forces_multiple_read_passes(self):
+        for key_name, der, pem in (
+            ("rsa", self.rsa_der, self.rsa_pem),
+            ("ed25519", self.ed_der, self.ed_pem),
+        ):
+            variants = {
+                "pad-both.pub":
+                    ascii_whitespace(CHUNK_SIZE + 17) + pem
+                    + ascii_whitespace(2 * CHUNK_SIZE + 101),
+                "pad-before.pub":
+                    ascii_whitespace(2 * CHUNK_SIZE - 1) + pem,
+                "pad-after.pub":
+                    pem + ascii_whitespace(3 * CHUNK_SIZE + 5),
+                "pad-crlf.pub":
+                    ascii_whitespace(CHUNK_SIZE - 1)
+                    + pem.replace(b"\n", b"\r\n")
+                    + ascii_whitespace(CHUNK_SIZE + 1),
+            }
+            for suffix, content in variants.items():
+                with self.subTest(key=key_name, variant=suffix):
+                    self._assert_fingerprint_for_content(
+                        content, der, f"multi/{key_name}/{suffix}"
+                    )
+
+    def test_each_whitespace_kind_alone_pads_across_reads(self):
+        # All six legal surrounding whitespace bytes, each on its own and in
+        # a run long enough to span several passes, before and after the
+        # block.
+        for byte in b" \t\r\n\x0b\x0c":
+            padding = bytes([byte]) * (CHUNK_SIZE + 13)
+            content = padding + self.ed_pem + padding
+            with self.subTest(byte=byte):
+                self._assert_fingerprint_for_content(
+                    content, self.ed_der, f"multi/ws-{byte:#04x}.pub"
+                )
+
+    def test_boundary_swept_across_begin_marker(self):
+        # For every k the boundary between the first two reads falls right
+        # after the k-th byte of the BEGIN marker (k == 0: immediately before
+        # it; k == len(BEGIN): between the complete marker and its newline).
+        for k in range(len(BEGIN) + 1):
+            with self.subTest(k=k):
+                content = (
+                    ascii_whitespace(CHUNK_SIZE - k) + self.rsa_pem
+                    + ascii_whitespace(CHUNK_SIZE)
+                )
+                self._assert_fingerprint_for_content(
+                    content, self.rsa_der, f"multi/begin-sweep/{k}.pub"
+                )
+
+    def test_boundary_swept_across_whole_block_lf_and_crlf(self):
+        # Exhaustive sweep: every byte position of both the LF and CRLF block
+        # layouts becomes the first byte of a later read pass, with trailing
+        # whitespace crossing yet another boundary. In particular this lands
+        # the CR and the LF of every CRLF pair in different passes.
+        for ending_name, newline in (("lf", b"\n"), ("crlf", b"\r\n")):
+            block = wrap_public_pem(self.rsa_der, 64, newline)
+            for offset in range(len(block) + 1):
+                with self.subTest(ending=ending_name, offset=offset):
+                    content = (
+                        ascii_whitespace(CHUNK_SIZE - offset) + block
+                        + ascii_whitespace(CHUNK_SIZE + 1)
+                    )
+                    self._assert_fingerprint_for_content(
+                        content, self.rsa_der,
+                        f"multi/sweep/{ending_name}/{offset}.pub",
+                    )
+
+    def test_each_crlf_pair_is_split_between_read_passes(self):
+        # Targeted version of the CRLF guarantee: for every CR in the block,
+        # that CR is the final byte of one pass and its LF the first byte of
+        # the next (header line, each base64 line, and the END line).
+        block = wrap_public_pem(self.ed_der, 16, b"\r\n")
+        cr_positions = [i for i, c in enumerate(block) if c == ord("\r")]
+        self.assertTrue(cr_positions)
+        for cr_pos in cr_positions:
+            with self.subTest(cr_pos=cr_pos):
+                content = (
+                    ascii_whitespace(CHUNK_SIZE - cr_pos - 1) + block
+                    + ascii_whitespace(CHUNK_SIZE)
+                )
+                self._assert_fingerprint_for_content(
+                    content, self.ed_der,
+                    f"multi/crlf-split/{cr_pos}.pub",
+                )
+
+    def test_alternative_base64_wrapping_spans_read_passes(self):
+        encoded_len = len(base64.b64encode(self.rsa_der))
+        layouts = (
+            (1, b"\n"), (4, b"\r\n"), (16, b"\n"), (64, b"\r\n"),
+            (73, b"\n"), (encoded_len, b"\n"),
+        )
+        # Offsets chosen to put a quantum start, a quantum middle and a line
+        # boundary on either side of a read boundary.
+        offsets = (0, 1, 2, 3, 4, 5, 7, 15, 16, 31, 63, 64, 65, 100)
+        for width, newline in layouts:
+            block = wrap_public_pem(self.rsa_der, width, newline)
+            for offset in offsets:
+                if offset > len(block):
+                    continue
+                with self.subTest(width=width, newline=newline, offset=offset):
+                    content = (
+                        ascii_whitespace(CHUNK_SIZE - offset) + block
+                        + ascii_whitespace(CHUNK_SIZE)
+                    )
+                    self._assert_fingerprint_for_content(
+                        content, self.rsa_der,
+                        f"multi/wrap/{width}-{offset}.pub",
+                    )
+
+    def test_complete_end_marker_at_eof_without_newline_is_valid(self):
+        # Normal completion versus truncation: a fully matched END marker is
+        # valid exactly at EOF with no trailing newline, including when its
+        # last bytes are delivered by a second read pass. A legal trailing
+        # newline or surrounding whitespace must give the same fingerprint.
+        block = wrap_public_pem(self.rsa_der, 64, b"\n", final_newline=False)
+        block_with_newline = wrap_public_pem(
+            self.rsa_der, 64, b"\n", final_newline=True
+        )
+        length = len(block)
+        variants = {
+            # Final '-' of END is the first byte of the second pass and EOF
+            # immediately follows -- a complete marker ending the file.
+            "end-final-byte-in-second-pass.pub":
+                ascii_whitespace(CHUNK_SIZE - length + 1) + block,
+            # Same block, but the legal trailing newline is what the second
+            # pass delivers; fingerprint must be identical.
+            "newline-in-second-pass.pub":
+                ascii_whitespace(CHUNK_SIZE - length) + block_with_newline,
+            # END marker itself straddles the boundary (3 bytes in the first
+            # pass, 21 in the second), EOF right after its last byte.
+            "end-split-then-eof.pub":
+                ascii_whitespace(CHUNK_SIZE - length + 21) + block,
+            # END straddles the boundary, then its newline and a postamble
+            # long enough to reach a third pass.
+            "end-split-then-whitespace.pub":
+                ascii_whitespace(CHUNK_SIZE - length + 21)
+                + block_with_newline + ascii_whitespace(CHUNK_SIZE + 7),
+        }
+        for name, content in variants.items():
+            with self.subTest(variant=name):
+                self._assert_fingerprint_for_content(
+                    content, self.rsa_der, f"multi/eof/{name}"
+                )
+
+    def test_second_key_far_beyond_first_block_is_rejected(self):
+        # The parser must keep checking all the way to EOF: the second key
+        # only appears several read passes after the first block completed, so
+        # accepting after the first END would print a fingerprint first.
+        far = 3 * CHUNK_SIZE + 123
+        variants = (
+            self.rsa_pem + ascii_whitespace(far) + self.ed_pem,
+            self.rsa_pem + ascii_whitespace(far) + self.ed_pem
+            + ascii_whitespace(CHUNK_SIZE),
+            self.rsa_pem + ascii_whitespace(2 * CHUNK_SIZE)
+            + BEGIN + b"\n",
+            ascii_whitespace(CHUNK_SIZE) + b"X"
+            + ascii_whitespace(CHUNK_SIZE) + self.rsa_pem,
+        )
+        for i, content in enumerate(variants):
+            with self.subTest(variant=i):
+                path = self.write_file(f"multi/far/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_stray_byte_far_after_block_is_rejected(self):
+        for stray in (b"X", b".", b"\x00", b"\xff"):
+            variants = (
+                self.ed_pem + ascii_whitespace(2 * CHUNK_SIZE + 71) + stray,
+                self.ed_pem + ascii_whitespace(2 * CHUNK_SIZE) + stray
+                + ascii_whitespace(CHUNK_SIZE),
+            )
+            for i, content in enumerate(variants):
+                with self.subTest(stray=stray, variant=i):
+                    path = self.write_file(
+                        f"multi/stray/{stray[0]:#04x}-{i}.pub", content
+                    )
+                    self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_truncated_begin_marker_near_read_boundary_is_rejected(self):
+        # "Near a boundary" in two distinct ways: the cut lands exactly as a
+        # read pass ends (second_bytes == 0), or marker bytes are split across
+        # passes and the file ends mid-marker inside the following pass. A
+        # complete marker with its newline cut (including CRLF cut after CR)
+        # is unfinished in the same sense.
+        cases = []
+        for cut in (1, 5, 10, 18, len(BEGIN) - 1, len(BEGIN)):
+            for in_first_pass in (0, 1, cut // 2, cut):
+                cases.append(
+                    ascii_whitespace(CHUNK_SIZE - in_first_pass) + BEGIN[:cut]
+                )
+        # Whole marker in the first pass, CR at the first byte of the second
+        # pass with its LF cut: a CRLF header split, then truncated.
+        cases.append(
+            ascii_whitespace(CHUNK_SIZE - len(BEGIN) - 1) + BEGIN + b"\r"
+        )
+        for i, content in enumerate(cases):
+            with self.subTest(case=i, length=len(content)):
+                path = self.write_file(f"multi/trunc-begin/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_truncated_end_marker_near_read_boundary_is_rejected(self):
+        prefix = self.rsa_pem[:self.rsa_pem.index(END)]
+        cases = []
+        for cut in (1, 5, 10, len(END) - 1):
+            for in_first_pass in (0, 1, 3, cut):
+                if in_first_pass > cut:
+                    continue
+                # in_first_pass END bytes arrive in the pass that already
+                # carries the whole body prefix; the other cut - in_first_pass
+                # bytes arrive in the next pass, then the file ends.
+                cases.append(
+                    ascii_whitespace(
+                        CHUNK_SIZE - len(prefix) - in_first_pass
+                    )
+                    + prefix + END[:cut]
+                )
+        for i, content in enumerate(cases):
+            with self.subTest(case=i, length=len(content)):
+                path = self.write_file(f"multi/trunc-end/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_truncated_base64_body_near_read_boundary_is_rejected(self):
+        encoded = base64.b64encode(self.rsa_der)
+        heads = []
+        # Dangling final quantum (1-3 base64 chars), no END line: EOF while
+        # body data is expected, split right at the boundary.
+        for tail in (1, 2, 3):
+            head = BEGIN + b"\n" + encoded[:64 + tail]
+            heads.append(head)
+        # Body ends on a quantum boundary but the END line never arrives.
+        heads.append(BEGIN + b"\n" + encoded)
+        # A body line ending in CR whose LF is cut by EOF.
+        heads.append(BEGIN + b"\n" + encoded[:64] + b"\r")
+        # Quantum-complete lines up to an unfinished last quantum followed by
+        # an END line: the marker is found, but the base64 stream did not end
+        # on a quantum boundary.
+        heads.append(BEGIN + b"\n" + encoded[:-1] + b"\n" + END + b"\n")
+        for i, head in enumerate(heads):
+            with self.subTest(case=i):
+                content = ascii_whitespace(CHUNK_SIZE - (len(head) - 1)) + head
+                path = self.write_file(f"multi/trunc-body/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
 
     # -- invalid content (exit code 1) -----------------------------------
 
