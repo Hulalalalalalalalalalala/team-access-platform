@@ -115,123 +115,14 @@ bool decodeBase64(const std::string& in, std::vector<unsigned char>& out) {
     return true;
 }
 
-std::string_view stripOneCr(std::string_view line) {
-    if (!line.empty() && line.back() == '\r') {
-        line.remove_suffix(1);
-    }
-    return line;
-}
-
-// Parses the strict single-block PEM structure:
-//
-//   [ASCII ws] -----BEGIN PUBLIC KEY----- LF/CRLF
-//   (base64 lines; no blank or whitespace-only lines) ...
-//   -----END PUBLIC KEY----- LF/CRLF
-//   [ASCII ws]
-//
-// Anything else is rejected: non-whitespace outside the block, more than one
-// block, any other PEM label (private keys, certificates, PKCS#1 RSA public
-// keys, ...), malformed or truncated base64. Returns the decoded payload
-// (nominally DER SubjectPublicKeyInfo) on success; structural DER validation
-// happens in the caller.
-bool parsePublicPem(const std::vector<unsigned char>& raw,
-                    std::vector<unsigned char>& payloadOut) {
-    const size_t n = raw.size();
-
-    // Preamble: only ASCII whitespace may precede the block.
-    size_t pos = 0;
-    while (pos < n && isAsciiSpace(raw[pos])) {
-        ++pos;
-    }
-    if (pos == n) {
-        return false;  // empty or whitespace-only file
-    }
-
-    auto takeLine = [&](size_t start,
-                        std::string_view& line) -> size_t {
-        size_t end = start;
-        while (end < n && raw[end] != '\n') {
-            ++end;
-        }
-        line = std::string_view(
-            reinterpret_cast<const char*>(raw.data() + start), end - start);
-        return (end < n) ? end + 1 : end;
-    };
-
-    std::string_view line;
-    pos = takeLine(pos, line);
-    // Exactly the BEGIN marker, optionally followed by a single CR (CRLF).
-    if (stripOneCr(line) != kPemBegin) {
-        return false;
-    }
-
-    std::string base64;
-    bool sawEnd = false;
-
-    while (pos < n) {
-        pos = takeLine(pos, line);
-        const std::string_view core = stripOneCr(line);
-
-        if (core == kPemEnd) {
-            sawEnd = true;
-            break;
-        }
-
-        if (core.empty()) {
-            return false;  // no blank lines inside the block
-        }
-        bool onlySpace = true;
-        for (char c : core) {
-            if (!isAsciiSpace(static_cast<unsigned char>(c))) {
-                onlySpace = false;
-                break;
-            }
-        }
-        if (onlySpace) {
-            return false;  // whitespace is allowed only around the block
-        }
-
-        // A payload line must be pure base64. '-' is deliberately not in the
-        // alphabet, so any other PEM boundary (a second block, a certificate
-        // or private-key label) fails here rather than being consumed.
-        for (char c : core) {
-            if (!isBase64Char(c)) {
-                return false;
-            }
-        }
-        base64.append(core);
-    }
-
-    if (!sawEnd) {
-        return false;  // truncated: no END line
-    }
-
-    // Nothing but ASCII whitespace may follow the block through EOF, so a
-    // second key or any appended text is rejected instead of ignored.
-    while (pos < n) {
-        if (!isAsciiSpace(raw[pos])) {
-            return false;
-        }
-        ++pos;
-    }
-
-    return decodeBase64(base64, payloadOut) && !payloadOut.empty();
-}
-
-// Validates that the decoded payload is one complete SubjectPublicKeyInfo DER
-// structure covering every byte, understood by the crypto library, and in
+// Validates that a decoded PEM payload is one complete SubjectPublicKeyInfo
+// DER structure covering every byte, understood by the crypto library, and in
 // canonical encoding. Re-encoding the parsed structure must reproduce the
 // payload byte for byte; that round trip rules out non-DER BER encodings and
 // other representations OpenSSL might otherwise accept. The bytes hashed for
 // the fingerprint are therefore the canonical SPKI DER, so PEM line wrapping
 // and line endings never influence the result.
-bool extractSpkiDer(const std::vector<unsigned char>& rawBytes,
-                    std::vector<unsigned char>& derOut) {
-    std::vector<unsigned char> payload;
-    if (!parsePublicPem(rawBytes, payload)) {
-        return false;
-    }
-
+bool isCanonicalSpkiDer(const std::vector<unsigned char>& payload) {
     const unsigned char* p = payload.data();
     const std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
         d2i_PUBKEY_ex(nullptr, &p, static_cast<long>(payload.size()), nullptr,
@@ -254,8 +145,6 @@ bool extractSpkiDer(const std::vector<unsigned char>& rawBytes,
     if (i2d_PUBKEY(pkey.get(), &q) != encLen || reencoded != payload) {
         return false;  // non-canonical DER
     }
-
-    derOut = std::move(payload);
     return true;
 }
 
@@ -268,8 +157,10 @@ bool extractSpkiDer(const std::vector<unsigned char>& rawBytes,
 // expressed by a ByteSink (see processFileChunks):
 //   * digest / verify-digest stream the bytes straight into SHA-256, so their
 //     memory use does not grow with the file;
-//   * key-id collects them, because parsing a PEM public key fundamentally
-//     needs the whole file (public keys are small).
+//   * key-id parses the PEM structure incrementally as the bytes arrive,
+//     keeping only the base64 payload of the PUBLIC KEY block, so its memory
+//     use tracks the size of the key encoding itself and never grows with
+//     whitespace around the block.
 // The error reporting for the access, open and read stages lives here once;
 // sinks report only their own processing failures.
 
@@ -400,24 +291,207 @@ private:
     unsigned char hash_[kSha256Size] = {};
 };
 
-// Collects every chunk into one byte buffer. Used by key-id, which needs the
-// complete file contents before it can parse and validate the public key.
-class CollectAllSink {
+// Incrementally parses the strict single-block PEM structure as the file's
+// chunks stream by:
+//
+//   [ASCII ws] -----BEGIN PUBLIC KEY----- LF/CRLF
+//   (base64 lines; no blank or whitespace-only lines) ...
+//   -----END PUBLIC KEY----- LF/CRLF
+//   [ASCII ws]
+//
+// Anything else is rejected: non-whitespace outside the block, more than one
+// block, any other PEM label (private keys, certificates, PKCS#1 RSA public
+// keys, ...), malformed or truncated base64, and payloads that are not one
+// canonical SubjectPublicKeyInfo DER structure.
+//
+// The parser is a byte-at-a-time state machine, so it needs no chunk or line
+// boundaries and never holds the raw file: whitespace before and after the
+// block is discarded as it is read, marker lines are matched against
+// fixed-size buffers bounded by the marker length, and only the base64
+// payload itself is accumulated. Memory use therefore tracks the size of the
+// key encoding, not the size of the file. The complete base64 text is decoded
+// and DER-validated only in finish(), once the END marker and a clean trailer
+// have been seen; a mid-read failure aborts before finish() and can never
+// produce a fingerprint from partial content.
+class PemPublicKeySink {
 public:
+    explicit PemPublicKeySink(const char* pathArg) : pathArg_(pathArg) {}
+
     bool start() { return true; }
 
     bool consume(const char* data, size_t size) {
-        const auto* begin = reinterpret_cast<const unsigned char*>(data);
-        bytes_.insert(bytes_.end(), begin, begin + size);
+        for (size_t i = 0; i < size; ++i) {
+            if (!feed(static_cast<unsigned char>(data[i]))) {
+                return reject();
+            }
+        }
         return true;
     }
 
-    bool finish() { return true; }
+    // Reached only after a read to normal EOF. A trailing CR ends the final
+    // line exactly as a CRLF would, and a final line without any newline is
+    // still a complete line; then the parse must have reached the trailer
+    // (a full BEGIN/payload/END block followed by whitespace only) and the
+    // accumulated base64 must decode to one canonical SPKI DER structure.
+    bool finish() {
+        if (pendingCr_ && !endLine()) {
+            return reject();
+        }
+        pendingCr_ = false;
+        if ((state_ == State::kBeginLine || state_ == State::kEndLine) &&
+            !endLine()) {
+            return reject();
+        }
+        if (state_ != State::kTrailer) {
+            return reject();  // empty, whitespace-only or truncated input
+        }
 
-    std::vector<unsigned char>& bytes() { return bytes_; }
+        std::vector<unsigned char> payload;
+        if (!decodeBase64(base64_, payload) || payload.empty() ||
+            !isCanonicalSpkiDer(payload)) {
+            return reject();
+        }
+        spkiDer_ = std::move(payload);
+        return true;
+    }
+
+    const std::vector<unsigned char>& spkiDer() const { return spkiDer_; }
 
 private:
-    std::vector<unsigned char> bytes_;
+    enum class State {
+        kPreamble,   // only ASCII whitespace seen so far
+        kBeginLine,  // buffering the line that must be the BEGIN marker
+        kPayload,    // inside the block, accumulating base64 lines
+        kEndLine,    // buffering a '-' led line that must be the END marker
+        kTrailer,    // END marker consumed; only ASCII whitespace may follow
+    };
+
+    // Feeds one byte to the state machine; false means the input cannot be
+    // the required single-PEM-block structure.
+    bool feed(unsigned char c) {
+        // A CR inside a line is legal only as the last byte before LF; the
+        // decision is deferred by one byte so the CR can simply be dropped.
+        if (pendingCr_) {
+            pendingCr_ = false;
+            if (c != '\n') {
+                return false;
+            }
+            return endLine();
+        }
+
+        switch (state_) {
+        case State::kPreamble:
+            if (isAsciiSpace(c)) {
+                return true;
+            }
+            state_ = State::kBeginLine;
+            lineBuf_.push_back(static_cast<char>(c));
+            return lineBuf_.size() <= kPemBegin.size();
+
+        case State::kBeginLine:
+            if (c == '\n') {
+                return endLine();
+            }
+            if (c == '\r') {
+                pendingCr_ = true;
+                return true;
+            }
+            lineBuf_.push_back(static_cast<char>(c));
+            // Longer than the marker can never match: reject at once instead
+            // of letting the buffer grow.
+            return lineBuf_.size() <= kPemBegin.size();
+
+        case State::kPayload:
+            if (c == '\n') {
+                return endLine();
+            }
+            if (c == '\r') {
+                pendingCr_ = true;
+                return true;
+            }
+            if (!lineHasChars_ && c == '-') {
+                // A line starting with '-' can only be the END marker; any
+                // other PEM boundary fails the comparison in endLine().
+                state_ = State::kEndLine;
+                lineBuf_.push_back('-');
+                return true;
+            }
+            // A payload line must be pure base64 ('=' included; its placement
+            // is validated by decodeBase64). Whitespace, stray bytes and any
+            // other character -- including a '-' that is not line-leading --
+            // reject the file.
+            if (isBase64Char(static_cast<char>(c))) {
+                base64_.push_back(static_cast<char>(c));
+                lineHasChars_ = true;
+                return true;
+            }
+            return false;
+
+        case State::kEndLine:
+            if (c == '\n') {
+                return endLine();
+            }
+            if (c == '\r') {
+                pendingCr_ = true;
+                return true;
+            }
+            lineBuf_.push_back(static_cast<char>(c));
+            return lineBuf_.size() <= kPemEnd.size();
+
+        case State::kTrailer:
+            // Nothing but ASCII whitespace may follow the block through EOF,
+            // so a second key or any appended text is rejected, never
+            // ignored -- and only after it scans clean does finish() accept.
+            return isAsciiSpace(c);
+        }
+        return false;  // unreachable
+    }
+
+    // Handles the end of the current line (LF, CRLF, a CR at EOF, or EOF
+    // itself for an unterminated final line).
+    bool endLine() {
+        switch (state_) {
+        case State::kBeginLine:
+            if (lineBuf_ != kPemBegin) {
+                return false;
+            }
+            lineBuf_.clear();
+            state_ = State::kPayload;
+            return true;
+        case State::kPayload:
+            if (!lineHasChars_) {
+                return false;  // no blank or whitespace-only lines inside
+            }
+            lineHasChars_ = false;
+            return true;
+        case State::kEndLine:
+            if (lineBuf_ != kPemEnd) {
+                return false;
+            }
+            lineBuf_.clear();
+            state_ = State::kTrailer;
+            return true;
+        case State::kPreamble:
+        case State::kTrailer:
+            return true;  // no line structure is tracked outside the block
+        }
+        return false;  // unreachable
+    }
+
+    bool reject() {
+        std::cerr << "sealmark: '" << pathArg_
+                  << "' does not contain a single valid PEM-encoded "
+                     "SubjectPublicKeyInfo public key (PUBLIC KEY)\n";
+        return false;
+    }
+
+    const char* pathArg_;
+    State state_ = State::kPreamble;
+    std::string lineBuf_;     // current marker line, bounded by marker length
+    std::string base64_;      // the block's payload, the only growing buffer
+    bool lineHasChars_ = false;
+    bool pendingCr_ = false;
+    std::vector<unsigned char> spkiDer_;
 };
 
 // Renders bytes as lowercase hexadecimal with no separators or prefix.
@@ -484,19 +558,12 @@ int verifyDigestFile(const char* pathArg, std::string_view expected) {
 }
 
 int keyIdFile(const char* pathArg) {
-    CollectAllSink sink;
+    PemPublicKeySink sink(pathArg);
     if (!processFileChunks(pathArg, sink)) {
         return 1;
     }
 
-    std::vector<unsigned char> spkiDer;
-    if (!extractSpkiDer(sink.bytes(), spkiDer)) {
-        std::cerr << "sealmark: '" << pathArg
-                  << "' does not contain a single valid PEM-encoded "
-                     "SubjectPublicKeyInfo public key (PUBLIC KEY)\n";
-        return 1;
-    }
-
+    const std::vector<unsigned char>& spkiDer = sink.spkiDer();
     unsigned char hash[kSha256Size];
     unsigned int hashLen = 0;
     if (EVP_Digest(spkiDer.data(), spkiDer.size(), hash, &hashLen,
