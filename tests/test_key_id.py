@@ -28,6 +28,16 @@ The key-id contract under test (see README):
   truncation leaving a marker or the base64 body unfinished at a read
   boundary, private keys, certificates and other public-key wrappers (e.g.
   PKCS#1 ``RSA PUBLIC KEY``) all fail;
+* the correct markers, legal base64 and a complete outer SEQUENCE are not
+  enough -- the decoded payload must itself be canonical SubjectPublicKeyInfo
+  DER covering every byte. A block whose *internal* encoding uses a
+  non-minimal (BER) length, whose RSA modulus/exponent INTEGER carries a
+  superfluous leading zero, or whose inner field declares a length different
+  from its actual content is rejected even though those bytes still name a
+  real public key: the command never normalizes the encoding and then
+  fingerprints the result. The single sign-protecting leading zero that a
+  positive INTEGER with its high bit set must carry is required by DER and
+  stays valid -- it must not be swept up in the rejection;
 * missing path / directory / unreadable input / invalid key content: exit
   code 1 with empty stdout and a stderr message containing the path -- the
   command never falls back to a file digest and never prints a partial
@@ -109,6 +119,147 @@ def wrap_public_pem(der, width=64, newline=b"\n", final_newline=True,
     return out
 
 
+def pem_public_payload(pem_bytes):
+    """Decode the base64 payload of a PUBLIC KEY PEM back to raw bytes."""
+    lines = pem_bytes.splitlines()
+    inner = b"".join(
+        line for line in lines
+        if not line.startswith(b"-----")
+    )
+    return base64.b64decode(inner, validate=True)
+
+
+# --- DER / TLV surgery -------------------------------------------------------
+#
+# The inner-DER tests keep the PEM framing, base64 and outer SPKI structure
+# intact while corrupting only the *internal* encoding. A minimal TLV parser
+# locates fields without reinterpreting them, and the builders below emit DER
+# length octets explicitly so a deliberately non-minimal length can be
+# produced (the high-level serializers only ever emit canonical DER).
+
+INTEGER_TAG = 0x02
+BIT_STRING_TAG = 0x03
+SEQUENCE_TAG = 0x30
+
+
+def encode_length(length):
+    """Minimal DER length octets for `length` (short or long form)."""
+    if length < 0x80:
+        return bytes([length])
+    body = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
+
+
+def encode_tlv(tag, content):
+    return bytes([tag]) + encode_length(len(content)) + content
+
+
+def nonminimal_length(length):
+    """Non-minimal (BER-legal, DER-illegal) length octets for `length`:
+
+    a value that fits in short form is forced into one long-form byte, and a
+    long-form value gets one extra leading zero byte (count bumped by one).
+    """
+    if length < 0x80:
+        return bytes([0x81, length])
+    minimal = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    body = b"\x00" + minimal
+    return bytes([0x80 | len(body)]) + body
+
+
+def parse_tlv(buf, offset):
+    """Parse one TLV at `offset`; return its boundaries and parsed length."""
+    tag = buf[offset]
+    first = buf[offset + 1]
+    if first < 0x80:
+        length = first
+        content_start = offset + 2
+    else:
+        count = first & 0x7F
+        length = int.from_bytes(
+            buf[offset + 2:offset + 2 + count], "big"
+        )
+        content_start = offset + 2 + count
+    return {
+        "tag": tag,
+        "start": offset,
+        "content_start": content_start,
+        "content_end": content_start + length,
+        "end": content_start + length,
+        "length": length,
+    }
+
+
+def split_spki(der):
+    """Split a SubjectPublicKeyInfo DER into its two inner top-level fields.
+
+    Returns (algid_tlv, bitstring_tlv), each the raw tag-length-value bytes.
+    """
+    outer = parse_tlv(der, 0)
+    algid = parse_tlv(der, outer["content_start"])
+    bitstring = parse_tlv(der, algid["end"])
+    assert bitstring["end"] == outer["content_end"], "unexpected trailing bytes"
+    return der[algid["start"]:algid["end"]], der[bitstring["start"]:
+                                                 bitstring["end"]]
+
+
+def split_rsa_public_key(der):
+    """Split an RSA SPKI DER into (algid_tlv, n_int_tlv, e_int_tlv)."""
+    algid, bitstring = split_spki(der)
+    bs = parse_tlv(bitstring, 0)
+    assert bs["tag"] == BIT_STRING_TAG
+    # BIT STRING content starts with the unused-bits count byte (must be 0).
+    assert bitstring[bs["content_start"]] == 0
+    inner = bitstring[bs["content_start"] + 1:bs["content_end"]]
+    rsk = parse_tlv(inner, 0)
+    assert rsk["tag"] == SEQUENCE_TAG
+    n_tlv = parse_tlv(inner, rsk["content_start"])
+    e_tlv = parse_tlv(inner, n_tlv["end"])
+    assert n_tlv["tag"] == INTEGER_TAG
+    assert e_tlv["tag"] == INTEGER_TAG
+    assert e_tlv["end"] == rsk["content_end"]
+    return (
+        algid,
+        inner[n_tlv["start"]:n_tlv["end"]],
+        inner[e_tlv["start"]:e_tlv["end"]],
+    )
+
+
+def tlv_content(tlv):
+    """Content bytes of a canonical TLV."""
+    info = parse_tlv(tlv, 0)
+    return tlv[info["content_start"]:info["content_end"]]
+
+
+def set_tlv_length_octets(tlv, length_octets):
+    """Re-emit one TLV keeping tag and content but with new length octets.
+
+    The input TLV is canonical, so its parsed span matches its real content;
+    only the length header is swapped (to a non-minimal encoding or a wrong
+    declared value). Nesting callers rewrap their parent, so an outer frame
+    can stay byte-consistent even when an inner field lies about its length.
+    """
+    info = parse_tlv(tlv, 0)
+    return (tlv[:1] + length_octets
+            + tlv[info["content_start"]:info["content_end"]])
+
+
+def set_integer_content(int_tlv, content):
+    """Re-emit an INTEGER TLV with different (but same-valued) content."""
+    return int_tlv[:1] + encode_length(len(content)) + content
+
+
+def spki_from_fields(algid_tlv, bitstring_tlv):
+    return encode_tlv(SEQUENCE_TAG, algid_tlv + bitstring_tlv)
+
+
+def rsa_spki_from_parts(algid_tlv, n_int_tlv, e_int_tlv):
+    """Rebuild an RSA SubjectPublicKeyInfo from its three inner TLVs."""
+    rsa_public_key = encode_tlv(SEQUENCE_TAG, n_int_tlv + e_int_tlv)
+    bitstring = encode_tlv(BIT_STRING_TAG, b"\x00" + rsa_public_key)
+    return spki_from_fields(algid_tlv, bitstring)
+
+
 # Every ASCII whitespace byte accepted around the PEM block (must match
 # isAsciiSpace in src/main.cpp): space, tab, LF, vertical tab, form feed, CR.
 AROUND_BLOCK_WHITESPACE = b" \t\n\x0b\x0c\r"
@@ -137,6 +288,24 @@ class SealmarkKeyIdTest(unittest.TestCase):
         cls.rsa_pub = cls.rsa_priv.public_key()
         cls.rsa_der = spki_der(cls.rsa_pub)
         cls.rsa_pem = cls.rsa_pub.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+        # A second RSA key whose modulus uses the full key width, so its most
+        # significant bit is set and the canonical INTEGER content must carry
+        # the single leading 0x00 that keeps the value positive. Regenerate in
+        # the (vanishingly unlikely) event a random modulus came up short.
+        cls.rsa_hi_priv = rsa.generate_private_key(public_exponent=65537,
+                                                   key_size=2048)
+        while cls.rsa_hi_priv.private_numbers().public_numbers.n.bit_length() \
+                != 2048:
+            cls.rsa_hi_priv = rsa.generate_private_key(
+                public_exponent=65537, key_size=2048
+            )
+        cls.rsa_hi_pub = cls.rsa_hi_priv.public_key()
+        cls.rsa_hi_der = spki_der(cls.rsa_hi_pub)
+        cls.rsa_hi_pem = cls.rsa_hi_pub.public_bytes(
             serialization.Encoding.PEM,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
@@ -188,6 +357,20 @@ class SealmarkKeyIdTest(unittest.TestCase):
         self.assertNotIn(b"spki-sha256", result.stderr)
         self.assertNotIn(b"Usage", result.stderr)
         self.assertTrue(result.stderr.endswith(b"\n"))
+
+    def assertInvalidPublicKey(self, result, path):
+        """A structurally present PEM whose *content* is not a canonical SPKI.
+
+        Like assertRejected but also pins the "public-key content invalid"
+        wording, so an inner-encoding failure is never misreported as a file
+        access/read problem -- and the path is still present.
+        """
+        self.assertRejected(result, path)
+        self.assertIn(
+            b"does not contain a single valid PEM-encoded "
+            b"SubjectPublicKeyInfo public key",
+            result.stderr,
+        )
 
     # -- success ---------------------------------------------------------
 
@@ -904,6 +1087,241 @@ class SealmarkKeyIdTest(unittest.TestCase):
         content = wrap_public_pem(broken_der)
         path = self.write_file("trailing-der.pub", content)
         self.assertRejected(self.run_key_id(str(path)), path)
+
+    # -- non-canonical INNER DER (exit code 1) ---------------------------
+    #
+    # The files in this section all pass the outer checks: the literal PUBLIC
+    # KEY markers are correct, the payload is legal canonical base64, and the
+    # decoded bytes start with a complete outer SubjectPublicKeyInfo SEQUENCE
+    # whose declared length covers exactly the bytes present. What is wrong is
+    # the *internal* DER: a non-minimal (BER) length, a superfluous leading
+    # zero on an RSA INTEGER, or an inner field whose declared length does not
+    # match its content. Such bytes can still name a real public key (the
+    # crypto library can parse them), but key-id must refuse to normalize and
+    # fingerprint them. run_inner_invalid() asserts those outer preconditions
+    # before asserting the rejection, so a case here can never silently be
+    # failing for the wrong (e.g. truncated-base64) reason.
+
+    def run_inner_invalid(self, relative_path, der):
+        outer = parse_tlv(der, 0)
+        self.assertEqual(der[0], SEQUENCE_TAG, "payload must be a SEQUENCE")
+        self.assertEqual(
+            outer["content_end"], len(der),
+            "outer SPKI frame must be complete and cover exactly the bytes",
+        )
+        pem_bytes = wrap_public_pem(der)
+        self.assertEqual(
+            pem_public_payload(pem_bytes), der,
+            "the inner bytes must be carried verbatim by legal base64",
+        )
+        path = self.write_file(relative_path, pem_bytes)
+        result = self.run_key_id(str(path))
+        self.assertInvalidPublicKey(result, path)
+        return path, result
+
+    def test_rsa_modulus_required_sign_protecting_zero_is_accepted(self):
+        # Distinct from a superfluous zero: a 2048-bit modulus has its top bit
+        # set, so DER REQUIRES one leading 0x00 to keep the INTEGER positive.
+        # That canonical key must succeed -- the rejection of abnormal
+        # encodings must not sweep up this mandatory padding.
+        _algid, n_int, _e_int = split_rsa_public_key(self.rsa_hi_der)
+        n_content = tlv_content(n_int)
+        self.assertEqual(n_content[0], 0x00)
+        self.assertTrue(n_content[1] & 0x80, "the single 0x00 must be needed")
+        self.assertEqual(len(n_content), 257)
+        path = self.write_file("rsa-hi.pub", self.rsa_hi_pem)
+        self.assertFingerprintOk(self.run_key_id(str(path)), self.rsa_hi_der)
+
+    def test_same_canonical_der_text_layout_never_changes_fingerprint(self):
+        # Text-only changes to ONE identical DER (base64 wrapping, LF vs CRLF,
+        # trailing newline) must collapse to one fingerprint for both
+        # algorithms; they must never be confused with a change to the inner
+        # binary encoding.
+        encoded_len = {
+            name: len(base64.b64encode(der))
+            for name, der in
+            (("rsa", self.rsa_hi_der), ("ed25519", self.ed_der))
+        }
+        for name, der in (("rsa", self.rsa_hi_der), ("ed25519", self.ed_der)):
+            expected = (fingerprint_of_der(der) + "\n").encode("ascii")
+            layouts = {
+                "lf64": wrap_public_pem(der, 64, b"\n"),
+                "crlf64": wrap_public_pem(der, 64, b"\r\n"),
+                "lf16": wrap_public_pem(der, 16, b"\n"),
+                "crlf1": wrap_public_pem(der, 1, b"\r\n"),
+                "single-line": wrap_public_pem(
+                    der, encoded_len[name], b"\n"
+                ),
+                "lf-no-final-newline":
+                    wrap_public_pem(der, 64, b"\n", final_newline=False),
+                "crlf-no-final-newline":
+                    wrap_public_pem(der, 64, b"\r\n", final_newline=False),
+            }
+            for layout, content in layouts.items():
+                with self.subTest(key=name, layout=layout):
+                    path = self.write_file(f"layout/{name}/{layout}.pub",
+                                           content)
+                    result = self.run_key_id(str(path))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, expected)
+
+    def test_nonminimal_inner_lengths_are_rejected(self):
+        r_algid, r_n, r_e = split_rsa_public_key(self.rsa_der)
+        _, r_bs = split_spki(self.rsa_der)
+        r_rsa_public_key = encode_tlv(SEQUENCE_TAG, r_n + r_e)
+
+        cases = {
+            # RSA, at every length-bearing inner node (outer stays minimal).
+            "rsa-algorithm-identifier": spki_from_fields(
+                set_tlv_length_octets(
+                    r_algid, nonminimal_length(len(tlv_content(r_algid)))
+                ),
+                r_bs,
+            ),
+            "rsa-bit-string": spki_from_fields(
+                r_algid,
+                set_tlv_length_octets(
+                    r_bs, nonminimal_length(len(tlv_content(r_bs)))
+                ),
+            ),
+            "rsa-rsapublickey-sequence": spki_from_fields(
+                r_algid,
+                encode_tlv(
+                    BIT_STRING_TAG,
+                    b"\x00" + set_tlv_length_octets(
+                        r_rsa_public_key,
+                        nonminimal_length(
+                            len(tlv_content(r_rsa_public_key))
+                        ),
+                    ),
+                ),
+            ),
+            "rsa-modulus-integer": rsa_spki_from_parts(
+                r_algid,
+                set_tlv_length_octets(
+                    r_n, nonminimal_length(len(tlv_content(r_n)))
+                ),
+                r_e,
+            ),
+            "rsa-exponent-integer": rsa_spki_from_parts(
+                r_algid,
+                r_n,
+                set_tlv_length_octets(
+                    r_e, nonminimal_length(len(tlv_content(r_e)))
+                ),
+            ),
+        }
+
+        e_algid, e_bs = split_spki(self.ed_der)
+        cases.update({
+            "ed25519-algorithm-identifier": spki_from_fields(
+                set_tlv_length_octets(
+                    e_algid, nonminimal_length(len(tlv_content(e_algid)))
+                ),
+                e_bs,
+            ),
+            "ed25519-bit-string": spki_from_fields(
+                e_algid,
+                set_tlv_length_octets(
+                    e_bs, nonminimal_length(len(tlv_content(e_bs)))
+                ),
+            ),
+        })
+
+        for label, der in cases.items():
+            with self.subTest(case=label):
+                self.run_inner_invalid(f"nonmin-len/{label}.pub", der)
+
+    def test_superfluous_leading_zeros_on_rsa_integers_are_rejected(self):
+        # Built from the high-bit-modulus key: its modulus already carries the
+        # one REQUIRED 0x00, so an additional zero is unambiguously
+        # superfluous. The exponent (0x010001) has its high bit clear and no
+        # padding at all. Either extra zero names the same integer/key but is
+        # non-canonical DER and must be rejected, never re-encoded first.
+        algid, n_int, e_int = split_rsa_public_key(self.rsa_hi_der)
+        n_content = tlv_content(n_int)
+        e_content = tlv_content(e_int)
+        # The modulus already carries exactly the one zero that DER requires
+        # (top bit set), so any further zero is strictly superfluous; the
+        # exponent's top bit is clear and it carries no such zero at all.
+        self.assertEqual(n_content[0], 0x00)
+        self.assertTrue(n_content[1] & 0x80)
+        self.assertEqual(e_content, (65537).to_bytes(3, "big"))
+        self.assertFalse(e_content[0] & 0x80)
+
+        cases = {
+            "modulus-one-extra-zero": rsa_spki_from_parts(
+                algid, set_integer_content(n_int, b"\x00" + n_content), e_int
+            ),
+            "modulus-two-extra-zeros": rsa_spki_from_parts(
+                algid,
+                set_integer_content(n_int, b"\x00\x00" + n_content),
+                e_int,
+            ),
+            "exponent-extra-zero": rsa_spki_from_parts(
+                algid, n_int, set_integer_content(e_int, b"\x00" + e_content)
+            ),
+        }
+        for label, der in cases.items():
+            with self.subTest(case=label):
+                self.run_inner_invalid(f"leading-zero/{label}.pub", der)
+
+    def test_inner_declared_length_mismatch_complete_outer_is_rejected(self):
+        # The outer SPKI SEQUENCE length (and the BIT STRING's, in the nested
+        # RSA case) is recomputed to match the bytes present exactly, so the
+        # outer encapsulation is whole; only an inner field lies about its own
+        # length. A complete-looking outer frame must not be accepted.
+        r_algid, r_n, r_e = split_rsa_public_key(self.rsa_der)
+        _, r_bs = split_spki(self.rsa_der)
+        r_rsa_public_key = encode_tlv(SEQUENCE_TAG, r_n + r_e)
+
+        cases = {}
+        for delta in (1, -1, 128):
+            cases[f"rsa-algorithm-identifier{delta:+d}"] = spki_from_fields(
+                set_tlv_length_octets(
+                    r_algid,
+                    encode_length(len(tlv_content(r_algid)) + delta),
+                ),
+                r_bs,
+            )
+
+        e_algid, e_bs = split_spki(self.ed_der)
+        for delta in (1, -1, 32):
+            cases[f"ed25519-bit-string{delta:+d}"] = spki_from_fields(
+                e_algid,
+                set_tlv_length_octets(
+                    e_bs, encode_length(len(tlv_content(e_bs)) + delta)
+                ),
+            )
+
+        for delta in (1, -1, 5):
+            lying_rsk = set_tlv_length_octets(
+                r_rsa_public_key,
+                encode_length(len(tlv_content(r_rsa_public_key)) + delta),
+            )
+            cases[f"rsa-rsapublickey-sequence{delta:+d}"] = spki_from_fields(
+                r_algid, encode_tlv(BIT_STRING_TAG, b"\x00" + lying_rsk)
+            )
+
+        for label, der in cases.items():
+            with self.subTest(case=label):
+                self.run_inner_invalid(f"len-mismatch/{label}.pub", der)
+
+    def test_invalid_inner_der_is_not_fingerprinted_and_file_not_modified(self):
+        # End-to-end guard for one case: no partial fingerprint, no fallback to
+        # a file digest, and the query only reads the file.
+        algid, n_int, e_int = split_rsa_public_key(self.rsa_hi_der)
+        bad = rsa_spki_from_parts(
+            algid,
+            set_integer_content(n_int, b"\x00" + tlv_content(n_int)),
+            e_int,
+        )
+        original = wrap_public_pem(bad)
+        path, result = self.run_inner_invalid("readonly/extra-zero.pub", bad)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"sha256:", result.stderr)
+        self.assertEqual(path.read_bytes(), original)
 
     # -- file failures (exit code 1) -------------------------------------
 
