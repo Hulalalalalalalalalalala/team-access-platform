@@ -11,11 +11,13 @@ The key-id contract under test (see README):
 * at least RSA and Ed25519 SubjectPublicKeyInfo public keys are supported
   (EC P-256 is covered as well);
 * the same key produces the same fingerprint under LF or CRLF line endings,
-  any legal base64 line wrapping, no trailing newline, and after the file is
-  moved or renamed -- even when large amounts of surrounding ASCII whitespace
-  carry the block through several 64 KiB read passes, with the begin marker,
-  base64 data, end marker and the two bytes of each CRLF straddling read
-  boundaries;
+  any legal base64 line wrapping, no trailing newline, or trailing ASCII
+  whitespace glued directly to the END marker with no line feed at all, and
+  after the file is moved or renamed -- even when large amounts of
+  surrounding ASCII whitespace carry the block through several 64 KiB read
+  passes, with the begin marker, base64 data, end marker, the first bytes of
+  the glued trailing whitespace and the two bytes of each CRLF straddling
+  read boundaries;
 * the fingerprint is independently recomputed here with hashlib over the DER
   obtained from the cryptography package, and one Ed25519 case is pinned to a
   known answer;
@@ -275,6 +277,36 @@ class SealmarkKeyIdTest(unittest.TestCase):
                     result.stdout, (expected + "\n").encode("ascii")
                 )
 
+    def test_whitespace_glued_directly_to_end_marker_is_ignored(self):
+        # A complete END marker needs no line feed at all: any ASCII
+        # whitespace byte may follow its final '-' immediately -- a lone
+        # space, a CR then a tab, vertical tab/form feed -- and EOF may
+        # follow right away or after arbitrarily many such bytes. The
+        # fingerprint is the same as with the conventional trailing LF.
+        expected = fingerprint_of_der(self.ed_der)
+        block = wrap_public_pem(self.ed_der, 64, b"\n", final_newline=False)
+        self.assertFalse(block.endswith((b"\n", b"\r")))
+        block_crlf = wrap_public_pem(
+            self.ed_der, 64, b"\r\n", final_newline=False
+        )
+        tails = [
+            b" ", b"\t", b"\r", b"\n", b"\x0b", b"\x0c",
+            b"\r\t", b"\x0b\x0c ", AROUND_BLOCK_WHITESPACE,
+            b" " + AROUND_BLOCK_WHITESPACE * 100,
+            b"\r\n " + AROUND_BLOCK_WHITESPACE,
+        ]
+        variants = [block + tail for tail in tails]
+        variants += [block_crlf + b" ", block_crlf + b"\r\t   "]
+        for i, content in enumerate(variants):
+            with self.subTest(variant=i):
+                path = self.write_file(f"glued/{i}.pub", content)
+                result = self.run_key_id(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    result.stdout, (expected + "\n").encode("ascii")
+                )
+
     def test_move_and_rename_do_not_change_fingerprint(self):
         names = [
             "key.pub",
@@ -490,6 +522,46 @@ class SealmarkKeyIdTest(unittest.TestCase):
                     content, self.rsa_der, f"multi/eof/{name}"
                 )
 
+    def test_glued_trailing_whitespace_survives_read_boundaries(self):
+        # The END marker and the whitespace glued directly to it may be split
+        # between read passes in every alignment: the boundary sweeps from
+        # several bytes before the marker completes (marker straddles) through
+        # several trailing bytes after it. The first byte past the complete
+        # marker is deliberately a space, so the old "must start with a line
+        # feed" rule rejected the splits that delivered that space in a later
+        # pass. Trailing whitespace spanning further passes adds no state
+        # beyond the fixed-size parser.
+        block = wrap_public_pem(self.rsa_der, 64, b"\n", final_newline=False)
+        tail = b" \t\r" + ascii_whitespace(CHUNK_SIZE + 7)
+        for delta in range(-(len(END) + 1), 9):
+            with self.subTest(delta=delta):
+                # delta < 0: the first pass ends -delta bytes before the END
+                # marker completes; delta >= 0: delta trailing bytes land in
+                # the first pass.
+                content = (
+                    ascii_whitespace(CHUNK_SIZE - len(block) - delta)
+                    + block + tail
+                )
+                self._assert_fingerprint_for_content(
+                    content, self.rsa_der, f"multi/glued/{delta}.pub"
+                )
+
+    def test_non_whitespace_after_glued_whitespace_run_is_rejected(self):
+        # Once the complete END marker is followed by whitespace, the parser
+        # must keep classifying bytes to EOF: a stray byte or a second key is
+        # rejected whether it follows the marker directly or a long whitespace
+        # run, including when the marker/whitespace join straddles a boundary.
+        block = wrap_public_pem(self.ed_der, 64, b"\n", final_newline=False)
+        for stray in (b"x", b" extra\n", self.rsa_pem, BEGIN + b"\n"):
+            for gap in (0, 1, 3, CHUNK_SIZE - 1, CHUNK_SIZE,
+                        2 * CHUNK_SIZE + 71):
+                with self.subTest(stray=stray[:8], gap=gap):
+                    content = block + b" " + ascii_whitespace(gap) + stray
+                    path = self.write_file(
+                        f"multi/glued-stray/{gap}.pub", content
+                    )
+                    self.assertRejected(self.run_key_id(str(path)), path)
+
     def test_second_key_far_beyond_first_block_is_rejected(self):
         # The parser must keep checking all the way to EOF: the second key
         # only appears several read passes after the first block completed, so
@@ -680,6 +752,28 @@ class SealmarkKeyIdTest(unittest.TestCase):
     def test_non_ascii_byte_after_block_is_rejected(self):
         path = self.write_file("hi.pub", self.rsa_pem + b"\xff\n")
         self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_non_whitespace_glued_to_end_marker_is_rejected(self):
+        # Whitespace relaxation starts only AFTER the complete marker: text
+        # glued to its final '-' with no whitespace between is still invalid,
+        # as is a truncated or internally misspelled marker followed by the
+        # whitespace a complete marker would have accepted.
+        block = wrap_public_pem(self.ed_der, 64, b"\n", final_newline=False)
+        contents = [
+            block + b"x",
+            block + b" extra\n",
+            block + b"-----",
+            block + b" ",  # placeholder, replaced below with truncated marker
+        ]
+        contents[3] = block[: -len(END)] + END[:-1] + b" "
+        contents.append(block[: -len(END)] + END[:-3] + b"   ")
+        contents.append(
+            block.replace(END, b"-----END  PUBLIC KEY-----", 1) + b" "
+        )
+        for i, content in enumerate(contents):
+            with self.subTest(case=i):
+                path = self.write_file(f"glued-bad/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
 
     def test_text_on_end_line_is_rejected(self):
         content = self.rsa_pem.replace(END + b"\n", END + b" extra\n")
