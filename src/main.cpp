@@ -18,6 +18,11 @@ constexpr std::string_view kDigestPrefix = "sha256:";
 constexpr size_t kDigestHexLen = 2 * kSha256Size;  // 64 lowercase hex chars
 constexpr std::string_view kSpkiFingerprintPrefix = "spki-sha256:";
 
+// Size of every read() issued against an input file. The digest commands
+// feed one chunk straight into the hash context, so large files cost only
+// this much memory; the Python regression suites reference this same value.
+constexpr size_t kReadChunkSize = 64 * 1024;
+
 constexpr std::string_view kPemBegin = "-----BEGIN PUBLIC KEY-----";
 constexpr std::string_view kPemEnd = "-----END PUBLIC KEY-----";
 
@@ -259,11 +264,30 @@ bool extractSpkiDer(const std::vector<unsigned char>& rawBytes,
     return true;
 }
 
-// Reads the whole regular file into memory. Parsing a PEM public key
-// fundamentally requires all of its bytes; public keys are small, so this
-// does not stream like digest/verify-digest. On failure prints a reason
-// (including the given path) to stderr and returns false.
-bool readFileAll(const char* pathArg, std::vector<unsigned char>& out) {
+// Shared file-ingestion path for digest, verify-digest and key-id: verify
+// that the argument names a regular file, open it, and stream its complete
+// raw bytes from the first byte through EOF in fixed-size kReadChunkSize
+// chunks. Each chunk is handed to consume(data, size); the final chunk may
+// be shorter than one buffer, and an empty file simply never invokes it.
+// Every chunk except the final one is full, so callers that pipe chunks
+// straight into a hash context keep memory use independent of file length.
+//
+// The failure stages stay distinguishable in the diagnostics, each message
+// naming pathArg exactly as passed:
+//   * the stat/access check itself fails  -> "cannot access ...";
+//   * it succeeds but the object is not a regular file
+//                                                         -> "is not a regular file";
+//   * a confirmed regular file cannot be opened          -> "cannot open ...";
+//   * reading fails after a successful open, even once
+//     some bytes have been delivered                     -> "failed to read ...".
+// A short final read (and immediate EOF on an empty file) is normal success,
+// never a read error. Returns true only after the whole file was read and
+// every consume call returned true. If consume returns false, streaming
+// stops and this returns false without printing a read error -- the caller
+// is responsible for describing that processing failure, and either way a
+// partially read file means the whole operation failed.
+template <typename Consume>
+bool streamRegularFile(const char* pathArg, Consume&& consume) {
     namespace fs = std::filesystem;
     const fs::path path(pathArg);
 
@@ -288,26 +312,34 @@ bool readFileAll(const char* pathArg, std::vector<unsigned char>& out) {
         return false;
     }
 
-    std::vector<unsigned char> bytes;
-    std::vector<char> buffer(64 * 1024);
+    std::vector<char> buffer(kReadChunkSize);
     while (in) {
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const std::streamsize got = in.gcount();
-        if (got > 0) {
-            bytes.insert(bytes.end(), buffer.data(), buffer.data() + got);
+        if (got > 0 &&
+            !consume(buffer.data(), static_cast<size_t>(got))) {
+            return false;  // processing failure; consume already reported it
         }
     }
     if (in.bad()) {
         std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
         return false;
     }
-    out = std::move(bytes);
     return true;
 }
 
 int keyIdFile(const char* pathArg) {
+    // Parsing a PEM public key fundamentally requires all of its bytes;
+    // public keys are small, so unlike the digest commands the chunks are
+    // accumulated here rather than streamed through a hash.
     std::vector<unsigned char> raw;
-    if (!readFileAll(pathArg, raw)) {
+    const bool readOk = streamRegularFile(
+        pathArg, [&](const char* data, size_t size) {
+            raw.insert(raw.end(), reinterpret_cast<const unsigned char*>(data),
+                       reinterpret_cast<const unsigned char*>(data) + size);
+            return true;
+        });
+    if (!readOk) {
         return 1;
     }
 
@@ -338,61 +370,59 @@ int keyIdFile(const char* pathArg) {
     return 0;
 }
 
-// Streams the file's complete raw bytes through SHA-256 using fixed-size
-// buffers, so memory use stays constant regardless of file size. On success
-// fills hashOut with exactly kSha256Size bytes and returns true; on failure
-// prints a reason (including pathArg) to stderr and returns false.
+// Streams the file's complete raw bytes through SHA-256 in the fixed-size
+// chunks provided by streamRegularFile, so memory use stays constant
+// regardless of file size. On success fills hashOut with exactly
+// kSha256Size bytes and returns true; on failure prints a reason (including
+// pathArg) to stderr and returns false. File-access/open/read failures are
+// reported by streamRegularFile; only hash-computation failures are handled
+// here.
 bool hashFile(const char* pathArg, unsigned char hashOut[kSha256Size]) {
-    namespace fs = std::filesystem;
-    const fs::path path(pathArg);
+    // The context is set up lazily inside the first chunk callback, keeping
+    // the original stage order: an access or open failure is reported as
+    // such before any hash-initialization error could be mentioned.
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+        EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    bool initialized = false;
 
-    std::error_code ec;
-    if (!fs::is_regular_file(path, ec)) {
-        if (ec) {
-            std::cerr << "sealmark: cannot access '" << pathArg << "': " << ec.message() << '\n';
-        } else {
-            std::cerr << "sealmark: '" << pathArg << "' is not a regular file\n";
-        }
+    const bool readOk = streamRegularFile(
+        pathArg, [&](const char* data, size_t size) {
+            if (!initialized) {
+                if (!ctx ||
+                    EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+                    std::cerr
+                        << "sealmark: SHA-256 initialization failed for '"
+                        << pathArg << "'\n";
+                    return false;
+                }
+                initialized = true;
+            }
+            if (EVP_DigestUpdate(ctx.get(), data, size) != 1) {
+                std::cerr << "sealmark: SHA-256 computation failed for '"
+                          << pathArg << "'\n";
+                return false;
+            }
+            return true;
+        });
+    if (!readOk) {
         return false;
     }
 
-    errno = 0;
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        const int err = errno;
-        std::cerr << "sealmark: cannot open '" << pathArg << "': "
-                  << (err != 0 ? std::strerror(err) : "open failed") << '\n';
-        return false;
-    }
-
-    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),
-                                                                      &EVP_MD_CTX_free);
-    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
-        std::cerr << "sealmark: SHA-256 initialization failed for '" << pathArg << "'\n";
-        return false;
-    }
-
-    // Stream the file in fixed-size chunks so memory use stays constant
-    // regardless of file size.
-    std::vector<char> buffer(64 * 1024);
-    while (in) {
-        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const std::streamsize got = in.gcount();
-        if (got > 0 &&
-            EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(got)) != 1) {
-            std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg << "'\n";
-            return false;
-        }
-    }
-    if (in.bad()) {
-        std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
+    // Empty file: no chunk ever arrived, so the context is initialized here
+    // before finalizing -- the standard empty-content hash is still produced.
+    if (!initialized &&
+        (!ctx ||
+         EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)) {
+        std::cerr << "sealmark: SHA-256 initialization failed for '" << pathArg
+                  << "'\n";
         return false;
     }
 
     unsigned int hashLen = 0;
     if (EVP_DigestFinal_ex(ctx.get(), hashOut, &hashLen) != 1 ||
         hashLen != kSha256Size) {
-        std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg << "'\n";
+        std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg
+                  << "'\n";
         return false;
     }
     return true;
