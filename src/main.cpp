@@ -259,11 +259,29 @@ bool extractSpkiDer(const std::vector<unsigned char>& rawBytes,
     return true;
 }
 
-// Reads the whole regular file into memory. Parsing a PEM public key
-// fundamentally requires all of its bytes; public keys are small, so this
-// does not stream like digest/verify-digest. On failure prints a reason
-// (including the given path) to stderr and returns false.
-bool readFileAll(const char* pathArg, std::vector<unsigned char>& out) {
+// --- Shared regular-file reading ------------------------------------------
+//
+// digest, verify-digest and key-id all walk the same pipeline: require a
+// regular file, open it, then read its complete raw bytes from the start in
+// fixed-size passes until normal EOF, treating text and binary content
+// identically. The three only differ in what happens to each chunk, which is
+// expressed by a ByteSink (see processFileChunks):
+//   * digest / verify-digest stream the bytes straight into SHA-256, so their
+//     memory use does not grow with the file;
+//   * key-id collects them, because parsing a PEM public key fundamentally
+//     needs the whole file (public keys are small).
+// The error reporting for the access, open and read stages lives here once;
+// sinks report only their own processing failures.
+
+// Size of every read pass for all three commands.
+constexpr size_t kReadChunkSize = 64 * 1024;
+
+// Requires pathArg to name an existing regular file and opens it for raw
+// binary reads. The two pre-read failure stages stay distinct: a failure to
+// stat/access the path ("cannot access", covering a missing path) and an
+// object that is not a regular file, followed by a failure to open it
+// ("cannot open"). On failure prints a reason containing pathArg to stderr.
+bool openRegularInput(const char* pathArg, std::ifstream& in) {
     namespace fs = std::filesystem;
     const fs::path path(pathArg);
 
@@ -280,136 +298,148 @@ bool readFileAll(const char* pathArg, std::vector<unsigned char>& out) {
     }
 
     errno = 0;
-    std::ifstream in(path, std::ios::binary);
+    in.open(path, std::ios::binary);
     if (!in) {
         const int err = errno;
         std::cerr << "sealmark: cannot open '" << pathArg << "': "
                   << (err != 0 ? std::strerror(err) : "open failed") << '\n';
         return false;
     }
-
-    std::vector<unsigned char> bytes;
-    std::vector<char> buffer(64 * 1024);
-    while (in) {
-        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const std::streamsize got = in.gcount();
-        if (got > 0) {
-            bytes.insert(bytes.end(), buffer.data(), buffer.data() + got);
-        }
-    }
-    if (in.bad()) {
-        std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
-        return false;
-    }
-    out = std::move(bytes);
     return true;
 }
 
-int keyIdFile(const char* pathArg) {
-    std::vector<unsigned char> raw;
-    if (!readFileAll(pathArg, raw)) {
-        return 1;
+// Feeds a regular file's complete raw bytes to sink:
+//   start()             once, immediately after the file is opened;
+//   consume(data, size) for every non-empty chunk, including a final short
+//                       one (a zero-length file yields no consume() call);
+//   finish()            exactly once, only after a read reaching normal EOF.
+// A false return aborts the operation and the sink is responsible for its own
+// diagnostic. A final read shorter than the chunk -- including zero bytes on
+// an empty file -- after a non-failed read is normal EOF; only a failed read
+// (badbit) after some bytes were delivered is a read error, which is reported
+// as such and never reaches finish(). Hence a mid-read failure can never
+// surface as a digest, a match/mismatch result or a key fingerprint.
+template <typename ByteSink>
+bool processFileChunks(const char* pathArg, ByteSink& sink) {
+    std::ifstream in;
+    if (!openRegularInput(pathArg, in)) {
+        return false;
     }
-
-    std::vector<unsigned char> spkiDer;
-    if (!extractSpkiDer(raw, spkiDer)) {
-        std::cerr << "sealmark: '" << pathArg
-                  << "' does not contain a single valid PEM-encoded "
-                     "SubjectPublicKeyInfo public key (PUBLIC KEY)\n";
-        return 1;
-    }
-
-    unsigned char hash[kSha256Size];
-    unsigned int hashLen = 0;
-    if (EVP_Digest(spkiDer.data(), spkiDer.size(), hash, &hashLen,
-                   EVP_sha256(), nullptr) != 1 ||
-        hashLen != kSha256Size) {
-        std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg
-                  << "'\n";
-        return 1;
-    }
-
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::cout << kSpkiFingerprintPrefix;
-    for (unsigned char byte : hash) {
-        std::cout << kHex[byte >> 4] << kHex[byte & 0x0f];
-    }
-    std::cout << '\n';
-    return 0;
-}
-
-// Streams the file's complete raw bytes through SHA-256 using fixed-size
-// buffers, so memory use stays constant regardless of file size. On success
-// fills hashOut with exactly kSha256Size bytes and returns true; on failure
-// prints a reason (including pathArg) to stderr and returns false.
-bool hashFile(const char* pathArg, unsigned char hashOut[kSha256Size]) {
-    namespace fs = std::filesystem;
-    const fs::path path(pathArg);
-
-    std::error_code ec;
-    if (!fs::is_regular_file(path, ec)) {
-        if (ec) {
-            std::cerr << "sealmark: cannot access '" << pathArg << "': " << ec.message() << '\n';
-        } else {
-            std::cerr << "sealmark: '" << pathArg << "' is not a regular file\n";
-        }
+    if (!sink.start()) {
         return false;
     }
 
-    errno = 0;
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        const int err = errno;
-        std::cerr << "sealmark: cannot open '" << pathArg << "': "
-                  << (err != 0 ? std::strerror(err) : "open failed") << '\n';
-        return false;
-    }
-
-    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),
-                                                                      &EVP_MD_CTX_free);
-    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
-        std::cerr << "sealmark: SHA-256 initialization failed for '" << pathArg << "'\n";
-        return false;
-    }
-
-    // Stream the file in fixed-size chunks so memory use stays constant
-    // regardless of file size.
-    std::vector<char> buffer(64 * 1024);
-    while (in) {
+    std::vector<char> buffer(kReadChunkSize);
+    while (true) {
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const std::streamsize got = in.gcount();
         if (got > 0 &&
-            EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(got)) != 1) {
-            std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg << "'\n";
+            !sink.consume(buffer.data(), static_cast<size_t>(got))) {
             return false;
         }
-    }
-    if (in.bad()) {
-        std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
-        return false;
+        if (in.bad()) {
+            // The file was already opened successfully; this is a read-stage
+            // failure, never an open error or a content/format problem.
+            std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
+            return false;
+        }
+        if (got < static_cast<std::streamsize>(buffer.size())) {
+            break;  // normal end of file: a short or empty final read
+        }
     }
 
-    unsigned int hashLen = 0;
-    if (EVP_DigestFinal_ex(ctx.get(), hashOut, &hashLen) != 1 ||
-        hashLen != kSha256Size) {
-        std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg << "'\n";
-        return false;
+    return sink.finish();
+}
+
+// Streams every chunk through SHA-256 with fixed-size buffers, so memory use
+// stays constant regardless of file size. On a processing failure it prints
+// the reason (including pathArg) itself; after success hash() holds exactly
+// kSha256Size bytes.
+class Sha256StreamSink {
+public:
+    explicit Sha256StreamSink(const char* pathArg) : pathArg_(pathArg) {}
+
+    bool start() {
+        ctx_.reset(EVP_MD_CTX_new());
+        if (!ctx_ ||
+            EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr) != 1) {
+            fail("SHA-256 initialization failed");
+            return false;
+        }
+        return true;
     }
-    return true;
+
+    bool consume(const char* data, size_t size) {
+        if (EVP_DigestUpdate(ctx_.get(), data, size) != 1) {
+            fail("SHA-256 computation failed");
+            return false;
+        }
+        return true;
+    }
+
+    bool finish() {
+        unsigned int hashLen = 0;
+        if (EVP_DigestFinal_ex(ctx_.get(), hash_, &hashLen) != 1 ||
+            hashLen != kSha256Size) {
+            fail("SHA-256 computation failed");
+            return false;
+        }
+        return true;
+    }
+
+    const unsigned char* hash() const { return hash_; }
+
+private:
+    void fail(const char* what) {
+        std::cerr << "sealmark: " << what << " for '" << pathArg_ << "'\n";
+    }
+
+    const char* pathArg_;
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx_{
+        nullptr, &EVP_MD_CTX_free};
+    unsigned char hash_[kSha256Size] = {};
+};
+
+// Collects every chunk into one byte buffer. Used by key-id, which needs the
+// complete file contents before it can parse and validate the public key.
+class CollectAllSink {
+public:
+    bool start() { return true; }
+
+    bool consume(const char* data, size_t size) {
+        const auto* begin = reinterpret_cast<const unsigned char*>(data);
+        bytes_.insert(bytes_.end(), begin, begin + size);
+        return true;
+    }
+
+    bool finish() { return true; }
+
+    std::vector<unsigned char>& bytes() { return bytes_; }
+
+private:
+    std::vector<unsigned char> bytes_;
+};
+
+// Renders bytes as lowercase hexadecimal with no separators or prefix.
+std::string toHexLower(const unsigned char* data, size_t size) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(2 * size);
+    for (size_t i = 0; i < size; ++i) {
+        out.push_back(kHex[data[i] >> 4]);
+        out.push_back(kHex[data[i] & 0x0f]);
+    }
+    return out;
 }
 
 int digestFile(const char* pathArg) {
-    unsigned char hash[kSha256Size];
-    if (!hashFile(pathArg, hash)) {
+    Sha256StreamSink sink(pathArg);
+    if (!processFileChunks(pathArg, sink)) {
         return 1;
     }
 
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::cout << "sha256:";
-    for (unsigned char byte : hash) {
-        std::cout << kHex[byte >> 4] << kHex[byte & 0x0f];
-    }
-    std::cout << '\n';
+    std::cout << kDigestPrefix
+              << toHexLower(sink.hash(), kSha256Size) << '\n';
     return 0;
 }
 
@@ -435,25 +465,51 @@ bool isValidExpectedDigest(std::string_view digest) {
 }
 
 int verifyDigestFile(const char* pathArg, std::string_view expected) {
-    unsigned char hash[kSha256Size];
-    if (!hashFile(pathArg, hash)) {
+    Sha256StreamSink sink(pathArg);
+    if (!processFileChunks(pathArg, sink)) {
         return 1;
     }
 
-    static constexpr char kHex[] = "0123456789abcdef";
-    char actual[kDigestPrefix.size() + kDigestHexLen];
-    std::memcpy(actual, kDigestPrefix.data(), kDigestPrefix.size());
-    for (size_t i = 0; i < kSha256Size; ++i) {
-        actual[kDigestPrefix.size() + 2 * i] = kHex[hash[i] >> 4];
-        actual[kDigestPrefix.size() + 2 * i + 1] = kHex[hash[i] & 0x0f];
-    }
+    std::string actual;
+    actual.reserve(kDigestPrefix.size() + kDigestHexLen);
+    actual.append(kDigestPrefix);
+    actual.append(toHexLower(sink.hash(), kSha256Size));
 
-    if (std::string_view(actual, sizeof(actual)) == expected) {
+    if (actual == expected) {
         std::cout << "match\n";
         return 0;
     }
     std::cout << "mismatch\n";
     return 3;
+}
+
+int keyIdFile(const char* pathArg) {
+    CollectAllSink sink;
+    if (!processFileChunks(pathArg, sink)) {
+        return 1;
+    }
+
+    std::vector<unsigned char> spkiDer;
+    if (!extractSpkiDer(sink.bytes(), spkiDer)) {
+        std::cerr << "sealmark: '" << pathArg
+                  << "' does not contain a single valid PEM-encoded "
+                     "SubjectPublicKeyInfo public key (PUBLIC KEY)\n";
+        return 1;
+    }
+
+    unsigned char hash[kSha256Size];
+    unsigned int hashLen = 0;
+    if (EVP_Digest(spkiDer.data(), spkiDer.size(), hash, &hashLen,
+                   EVP_sha256(), nullptr) != 1 ||
+        hashLen != kSha256Size) {
+        std::cerr << "sealmark: SHA-256 computation failed for '" << pathArg
+                  << "'\n";
+        return 1;
+    }
+
+    std::cout << kSpkiFingerprintPrefix
+              << toHexLower(hash, kSha256Size) << '\n';
+    return 0;
 }
 
 }  // namespace
