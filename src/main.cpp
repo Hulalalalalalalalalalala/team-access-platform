@@ -185,8 +185,12 @@ private:
 //
 //   [ASCII ws] -----BEGIN PUBLIC KEY----- LF/CRLF
 //   (base64 lines; no blank or whitespace-only lines) ...
-//   -----END PUBLIC KEY----- LF/CRLF
-//   [ASCII ws]
+//   -----END PUBLIC KEY----- [ASCII ws]
+//
+// The complete END marker may be followed immediately by EOF or by any
+// amount of ASCII whitespace in any combination; unlike the BEGIN line, no
+// LF/CRLF is required first (a single space or a CR not followed by LF is
+// just as legal).
 //
 // Bytes are fed straight from the read passes, chunk by chunk, and nothing is
 // retained besides the fixed-size parser state and the decoded payload: the
@@ -229,14 +233,9 @@ public:
         bool ok = false;
         switch (phase_) {
             case Phase::kEndMarker:
-                // A fully matched END line needs no trailing line feed at
-                // EOF; an unfinished match is a truncated marker.
+                // A fully matched END marker is complete at EOF; an
+                // unfinished match is a truncated marker.
                 ok = markerMatched_ == kPemEnd.size();
-                break;
-            case Phase::kEndCr:
-                // An END line ending in CR is accepted at EOF too, exactly
-                // as the whole-file parser stripped that final CR.
-                ok = true;
                 break;
             case Phase::kPostamble:
                 ok = true;
@@ -271,7 +270,6 @@ private:
         kBodyData,
         kBodyCr,
         kEndMarker,
-        kEndCr,
         kPostamble,
     };
 
@@ -356,25 +354,17 @@ private:
                 return true;
 
             case Phase::kEndMarker:
-                if (c == '\n') {
-                    return markerMatched_ == kPemEnd.size() && endComplete();
+                if (markerMatched_ == kPemEnd.size()) {
+                    // The complete END marker may be followed directly by
+                    // any ASCII whitespace (or EOF, handled in finish());
+                    // anything else after it is invalid content.
+                    return isAsciiSpace(c) && endComplete();
                 }
-                if (c == '\r') {
-                    if (markerMatched_ != kPemEnd.size()) {
-                        return false;
-                    }
-                    phase_ = Phase::kEndCr;
-                    return true;
-                }
-                if (markerMatched_ < kPemEnd.size() &&
-                    c == static_cast<unsigned char>(kPemEnd[markerMatched_])) {
+                if (c == static_cast<unsigned char>(kPemEnd[markerMatched_])) {
                     ++markerMatched_;
                     return true;
                 }
                 return false;
-
-            case Phase::kEndCr:
-                return c == '\n' && endComplete();
 
             case Phase::kPostamble:
                 // Everything still in the file must be ASCII whitespace; a

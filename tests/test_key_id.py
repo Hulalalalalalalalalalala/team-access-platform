@@ -275,6 +275,34 @@ class SealmarkKeyIdTest(unittest.TestCase):
                     result.stdout, (expected + "\n").encode("ascii")
                 )
 
+    def test_whitespace_directly_after_end_marker_without_newline(self):
+        # The complete END marker may be followed immediately by any amount
+        # of ASCII whitespace in any combination; no newline is required
+        # first, and a CR need not be part of a CRLF pair.
+        expected = fingerprint_of_der(self.ed_der)
+        block = wrap_public_pem(self.ed_der, 64, b"\n", final_newline=False)
+        variants = [
+            block + b" ",
+            block + b"\t",
+            block + b"\r",
+            block + b"\x0b",
+            block + b"\x0c",
+            block + b"\n",
+            block + b"\r\t",
+            block + b"\r\r",
+            block + b" \t\r\n\x0b\x0c ",
+            block + b" " * 100,
+        ]
+        for i, content in enumerate(variants):
+            with self.subTest(variant=i):
+                path = self.write_file(f"endws/{i}.pub", content)
+                result = self.run_key_id(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    result.stdout, (expected + "\n").encode("ascii")
+                )
+
     def test_move_and_rename_do_not_change_fingerprint(self):
         names = [
             "key.pub",
@@ -490,6 +518,33 @@ class SealmarkKeyIdTest(unittest.TestCase):
                     content, self.rsa_der, f"multi/eof/{name}"
                 )
 
+    def test_end_marker_and_attached_whitespace_split_across_read_passes(self):
+        # The END marker completes in one read pass and the whitespace
+        # directly attached to it (with no newline in between) only arrives
+        # in later passes -- the result must be the same as when everything
+        # is delivered together.
+        block = wrap_public_pem(self.rsa_der, 64, b"\n", final_newline=False)
+        variants = {
+            # Final '-' of END is the last byte of the first pass; a single
+            # space opens the second pass and EOF follows.
+            "space-in-second-pass.pub":
+                ascii_whitespace(CHUNK_SIZE - len(block)) + block + b" ",
+            # END completes mid-pass, one space follows, then the pass ends;
+            # a long mixed-whitespace tail spans further passes.
+            "tail-spans-passes.pub":
+                ascii_whitespace(CHUNK_SIZE - len(block) - 1) + block
+                + b" " + ascii_whitespace(2 * CHUNK_SIZE + 9),
+            # CR ending the first pass, tab (not LF) opening the second.
+            "cr-tab-split.pub":
+                ascii_whitespace(CHUNK_SIZE - len(block)) + block + b"\r"
+                + b"\t" + ascii_whitespace(CHUNK_SIZE),
+        }
+        for name, content in variants.items():
+            with self.subTest(variant=name):
+                self._assert_fingerprint_for_content(
+                    content, self.rsa_der, f"multi/endws/{name}"
+                )
+
     def test_second_key_far_beyond_first_block_is_rejected(self):
         # The parser must keep checking all the way to EOF: the second key
         # only appears several read passes after the first block completed, so
@@ -685,6 +740,47 @@ class SealmarkKeyIdTest(unittest.TestCase):
         content = self.rsa_pem.replace(END + b"\n", END + b" extra\n")
         path = self.write_file("endline.pub", content)
         self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_non_whitespace_after_end_marker_whitespace_is_rejected(self):
+        # Whitespace directly after the complete END marker is legal, but
+        # any non-whitespace content beyond it -- adjacent or separated by a
+        # long whitespace run -- is still rejected, including a second key.
+        block = wrap_public_pem(self.rsa_der, 64, b"\n", final_newline=False)
+        variants = [
+            block + b" x",
+            block + b" \t\r\n\x0b\x0c" + b"x",
+            block + b" " + self.ed_pem,
+            block + b"\t" + BEGIN + b"\n",
+            block + b"\x00",
+            block + b" \xff",
+            block + b" " + END,
+        ]
+        for i, content in enumerate(variants):
+            with self.subTest(variant=i):
+                path = self.write_file(f"endjunk/{i}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_whitespace_inside_end_marker_is_rejected(self):
+        # The marker itself must match literally: a tab where the marker has
+        # a space, or an extra space inside it, is not the END marker.
+        for broken in (
+            b"-----END\tPUBLIC KEY-----",
+            b"-----END  PUBLIC KEY-----",
+            b"-----END PUBLIC  KEY-----",
+        ):
+            with self.subTest(broken=broken):
+                content = self.rsa_pem.replace(END, broken, 1)
+                path = self.write_file("endmarker.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
+
+    def test_truncated_end_marker_followed_by_whitespace_is_rejected(self):
+        # A partial END marker is not completed by trailing whitespace.
+        prefix = self.rsa_pem[:self.rsa_pem.index(END)]
+        for cut in (1, 5, 10, len(END) - 1):
+            with self.subTest(cut=cut):
+                content = prefix + END[:cut] + b" \t\r\n"
+                path = self.write_file(f"truncendws/{cut}.pub", content)
+                self.assertRejected(self.run_key_id(str(path)), path)
 
     def test_space_inside_payload_line_is_rejected(self):
         encoded = base64.b64encode(self.rsa_der)
