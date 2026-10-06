@@ -44,6 +44,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import nonregular_input as nri
+
 # Must match the read buffer size in src/main.cpp.
 CHUNK_SIZE = 64 * 1024
 
@@ -277,6 +279,38 @@ class SealmarkDigestTest(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertIn(os.fsencode(str(directory)), result.stderr)
         self.assertNotIn(b"Usage", result.stderr)
+
+    # -- non-regular inputs are judged on the opened object --------------
+    #
+    # A FIFO (whether or not anyone is writing) must never be digested and
+    # must never make the command wait for the other end; only the object
+    # actually opened decides regularity, and symlinks resolving to a regular
+    # file keep working. Shared with the other two suites.
+
+    @nri.requires_nonregular_input
+    def test_fifo_and_symlink_inputs_follow_the_single_regular_file_rule(self):
+        content = make_content(1000)
+        path = self.write_file("regular 文档/doc.bin", content)
+        nri.run_all(
+            self,
+            args=lambda p: ["digest", str(p)],
+            regular_path=path,
+            expected_stdout=expected_output(content),
+            valid_payload=content,
+            tmp=self.tmp,
+        )
+
+    @nri.requires_toctou_preload
+    def test_file_swapped_to_fifo_after_check_is_judged_on_opened_object(self):
+        # Deterministic check/open swap: path-based stat is fed "regular
+        # file" while open() really opens a data-ready FIFO. The digest must
+        # be refused promptly with no digest and no blocking on the pipe.
+        nri.run_toctou_all(
+            self,
+            args=lambda p: ["digest", str(p)],
+            valid_payload=make_content(5000),
+            tmp=self.tmp,
+        )
 
     # -- read failure after a successful open (exit code 1) -------------
     #

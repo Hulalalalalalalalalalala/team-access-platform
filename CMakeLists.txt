@@ -22,6 +22,12 @@ enable_testing()
 # be exercised without root, FUSE, or relying on coincidental file changes.
 # Its location is handed to the Python tests through SEALMARK_READFAIL_PRELOAD;
 # when unset (non-Linux) the corresponding tests skip themselves.
+#
+# A second preload (SEALMARK_TOCTOU_PRELOAD) makes the path-based status
+# calls lie -- reporting one chosen FIFO as a regular file -- while leaving
+# open() untouched, so the "file type is decided on the object actually
+# opened, not on a separate stat of the path" rule can be tested without a
+# real check/open race.
 set(SEALMARK_TEST_ENV "SEALMARK_BIN=$<TARGET_FILE:sealmark>")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)
@@ -34,9 +40,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         C_STANDARD 11
     )
     target_link_libraries(sealmark_readfail_preload PRIVATE ${CMAKE_DL_LIBS})
+
+    add_library(sealmark_toctou_preload MODULE tests/toctou_preload.c)
+    set_target_properties(
+        sealmark_toctou_preload
+        PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        PREFIX ""
+        C_STANDARD 11
+    )
+    target_link_libraries(sealmark_toctou_preload PRIVATE ${CMAKE_DL_LIBS})
+
     list(
         APPEND SEALMARK_TEST_ENV
         "SEALMARK_READFAIL_PRELOAD=$<TARGET_FILE:sealmark_readfail_preload>"
+        "SEALMARK_TOCTOU_PRELOAD=$<TARGET_FILE:sealmark_toctou_preload>"
     )
 endif()
 

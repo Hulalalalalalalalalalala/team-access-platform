@@ -1,11 +1,12 @@
 #include <cerrno>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include <openssl/evp.h>
@@ -39,11 +40,12 @@ bool isAsciiSpace(unsigned char c) {
 
 // --- Shared regular-file reading ------------------------------------------
 //
-// digest, verify-digest and key-id all walk the same pipeline: require a
-// regular file, open it, then read its complete raw bytes from the start in
-// fixed-size passes until normal EOF, treating text and binary content
-// identically. The three only differ in what happens to each chunk, which is
-// expressed by a ByteSink (see processFileChunks):
+// digest, verify-digest and key-id all walk the same pipeline: open the
+// input, require the object actually opened to be a regular file, then read
+// its complete raw bytes from the start in fixed-size passes until normal
+// EOF, treating text and binary content identically. The three only differ
+// in what happens to each chunk, which is expressed by a ByteSink (see
+// processFileChunks):
 //   * digest / verify-digest stream the bytes straight into SHA-256, so their
 //     memory use does not grow with the file;
 //   * key-id runs a streaming PEM parser over the chunks: the surrounding
@@ -51,43 +53,75 @@ bool isAsciiSpace(unsigned char c) {
 //     being retained, and only the decoded SubjectPublicKeyInfo DER is kept,
 //     so its memory use tracks the (small) public-key encoding rather than
 //     the file size.
-// The error reporting for the access, open and read stages lives here once;
-// sinks report only their own processing failures.
+// The error reporting for the open, file-type and read stages lives here
+// once; sinks report only their own processing failures.
 
 // Size of every read pass for all three commands.
 constexpr size_t kReadChunkSize = 64 * 1024;
 
-// Requires pathArg to name an existing regular file and opens it for raw
-// binary reads. The two pre-read failure stages stay distinct: a failure to
-// stat/access the path ("cannot access", covering a missing path) and an
-// object that is not a regular file, followed by a failure to open it
-// ("cannot open"). On failure prints a reason containing pathArg to stderr.
-bool openRegularInput(const char* pathArg, std::ifstream& in) {
-    namespace fs = std::filesystem;
-    const fs::path path(pathArg);
-
-    std::error_code ec;
-    if (!fs::is_regular_file(path, ec)) {
-        if (ec) {
-            std::cerr << "sealmark: cannot access '" << pathArg << "': "
-                      << ec.message() << '\n';
-        } else {
-            std::cerr << "sealmark: '" << pathArg
-                      << "' is not a regular file\n";
-        }
-        return false;
-    }
-
-    errno = 0;
-    in.open(path, std::ios::binary);
-    if (!in) {
+// Opens pathArg and requires the object actually opened -- the final target
+// of any symlink chain, examined on the open file descriptor itself -- to be
+// a regular file. The descriptor is fstat()ed, not the path: opening and the
+// type decision are one and the same object, so there is no window in which a
+// path that named a regular file at check time could be swapped for a FIFO or
+// other non-regular object before it is opened. A FIFO is opened with
+// O_NONBLOCK so the open itself never blocks waiting for the other end; the
+// descriptor is closed immediately after fstat() shows it is not regular, so
+// a FIFO's data is never read and no FIFO read can ever block. Once a regular
+// file is held open, later reads always refer to that same file even if the
+// path is renamed or replaced afterwards.
+//
+// The two pre-read failure stages stay distinct: a failure to open the path
+// ("cannot open", covering a path that vanished, a dangling symlink or a
+// traversal/permission error) and an object that opened but is not a regular
+// file ("is not a regular file"). On failure prints a reason containing
+// pathArg to stderr, closes any descriptor it opened and returns -1.
+int openRegularInput(const char* pathArg) {
+    // O_NONBLOCK keeps an open() on a FIFO without a writer from blocking;
+    // it has no effect on regular files. O_CLOEXEC does not change behavior
+    // for this process but keeps the descriptor from leaking if a later
+    // change ever execs.
+    int fd = ::open(pathArg, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
         const int err = errno;
         std::cerr << "sealmark: cannot open '" << pathArg << "': "
-                  << (err != 0 ? std::strerror(err) : "open failed") << '\n';
-        return false;
+                  << std::strerror(err) << '\n';
+        return -1;
     }
-    return true;
+
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const int err = errno;
+        std::cerr << "sealmark: cannot open '" << pathArg << "': "
+                  << std::strerror(err) << '\n';
+        ::close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        std::cerr << "sealmark: '" << pathArg
+                  << "' is not a regular file\n";
+        ::close(fd);
+        return -1;
+    }
+    return fd;
 }
+
+// Closes the descriptor on destruction, so every failure path below -- a
+// failed start(), a rejected chunk or a read error -- releases it.
+class FdGuard {
+public:
+    explicit FdGuard(int fd) : fd_(fd) {}
+    ~FdGuard() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+
+private:
+    int fd_;
+};
 
 // Feeds a regular file's complete raw bytes to sink:
 //   start()             once, immediately after the file is opened;
@@ -95,37 +129,55 @@ bool openRegularInput(const char* pathArg, std::ifstream& in) {
 //                       one (a zero-length file yields no consume() call);
 //   finish()            exactly once, only after a read reaching normal EOF.
 // A false return aborts the operation and the sink is responsible for its own
-// diagnostic. A final read shorter than the chunk -- including zero bytes on
-// an empty file -- after a non-failed read is normal EOF; only a failed read
-// (badbit) after some bytes were delivered is a read error, which is reported
-// as such and never reaches finish(). Hence a mid-read failure can never
-// surface as a digest, a match/mismatch result or a key fingerprint.
+// diagnostic. read() on a regular file is allowed to return fewer bytes than
+// requested without meaning EOF (an interrupt, a short kernel read, ...), so
+// each pass keeps reading until the buffer fills or read() reports zero; only
+// a zero return is normal EOF. A read error -- including one after some bytes
+// were already delivered -- is reported as such and never reaches finish(), so
+// a mid-read failure can never surface as a digest, a match/mismatch result
+// or a key fingerprint.
 template <typename ByteSink>
 bool processFileChunks(const char* pathArg, ByteSink& sink) {
-    std::ifstream in;
-    if (!openRegularInput(pathArg, in)) {
+    const int openedFd = openRegularInput(pathArg);
+    if (openedFd < 0) {
         return false;
     }
+    FdGuard fdGuard(openedFd);
     if (!sink.start()) {
         return false;
     }
 
     std::vector<char> buffer(kReadChunkSize);
     while (true) {
-        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const std::streamsize got = in.gcount();
-        if (got > 0 &&
-            !sink.consume(buffer.data(), static_cast<size_t>(got))) {
-            return false;
+        size_t filled = 0;
+        bool reachedEof = false;
+        while (filled < buffer.size()) {
+            ssize_t got = 0;
+            do {
+                got = ::read(openedFd, buffer.data() + filled,
+                             buffer.size() - filled);
+            } while (got < 0 && errno == EINTR);
+            if (got < 0) {
+                // The file was already opened successfully; this is a
+                // read-stage failure, never an open error or a content/format
+                // problem -- even if earlier bytes of this pass were already
+                // delivered to the sink.
+                std::cerr << "sealmark: failed to read '" << pathArg
+                          << "'\n";
+                return false;
+            }
+            if (got == 0) {
+                reachedEof = true;  // normal end of file
+                break;
+            }
+            const size_t n = static_cast<size_t>(got);
+            if (!sink.consume(buffer.data() + filled, n)) {
+                return false;
+            }
+            filled += n;
         }
-        if (in.bad()) {
-            // The file was already opened successfully; this is a read-stage
-            // failure, never an open error or a content/format problem.
-            std::cerr << "sealmark: failed to read '" << pathArg << "'\n";
-            return false;
-        }
-        if (got < static_cast<std::streamsize>(buffer.size())) {
-            break;  // normal end of file: a short or empty final read
+        if (reachedEof) {
+            break;
         }
     }
 

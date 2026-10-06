@@ -68,6 +68,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from cryptography.x509.oid import NameOID
 
+import nonregular_input as nri
+
 # Must match the read buffer size in src/main.cpp.
 CHUNK_SIZE = 64 * 1024
 
@@ -1340,6 +1342,40 @@ class SealmarkKeyIdTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, b"")
         self.assertIn(os.fsencode(str(directory)), result.stderr)
+
+    # -- non-regular inputs are judged on the opened object --------------
+    #
+    # A FIFO (with or without a writer) carrying even a perfectly valid
+    # PUBLIC KEY block is rejected with exit code 1 without blocking and can
+    # never yield a fingerprint or an "invalid key" verdict; only the object
+    # actually opened decides regularity, and symlinks resolving to a regular
+    # key file keep working. Shared with the other two suites.
+
+    @nri.requires_nonregular_input
+    def test_fifo_and_symlink_inputs_follow_the_single_regular_file_rule(self):
+        path = self.write_file("keys 目录/real 公钥.pem", self.rsa_pem)
+        nri.run_all(
+            self,
+            args=lambda p: ["key-id", str(p)],
+            regular_path=path,
+            expected_stdout=(
+                fingerprint_of_der(self.rsa_der) + "\n"
+            ).encode("ascii"),
+            valid_payload=self.rsa_pem,
+            tmp=self.tmp,
+        )
+
+    @nri.requires_toctou_preload
+    def test_file_swapped_to_fifo_after_check_is_judged_on_opened_object(self):
+        # The bytes in the FIFO form a perfectly valid PUBLIC KEY, yet a
+        # swapped input is refused with exit 1: no fingerprint, no "invalid
+        # key" verdict, and no blocking on the pipe.
+        nri.run_toctou_all(
+            self,
+            args=lambda p: ["key-id", str(p)],
+            valid_payload=self.rsa_pem,
+            tmp=self.tmp,
+        )
 
     @unittest.skipIf(
         hasattr(os, "geteuid") and os.geteuid() == 0,

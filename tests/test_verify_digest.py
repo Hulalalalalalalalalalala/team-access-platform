@@ -43,6 +43,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import nonregular_input as nri
+
 # Must match the read buffer size in src/main.cpp.
 CHUNK_SIZE = 64 * 1024
 
@@ -312,6 +314,52 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         directory.mkdir()
         result = self.run_verify(str(directory), f"sha256:{EMPTY_FILE_SHA256}")
         self.assertFileFailure(result, directory)
+
+    # -- non-regular inputs are judged on the opened object --------------
+    #
+    # A FIFO (with or without a writer/data) is rejected with exit code 1
+    # without blocking and can never surface as match or mismatch; only the
+    # object actually opened decides regularity, and symlinks resolving to a
+    # regular file keep matching. Shared with the other two suites.
+
+    @nri.requires_nonregular_input
+    def test_fifo_and_symlink_inputs_follow_the_single_regular_file_rule(self):
+        content = make_content(1000)
+        path = self.write_file("regular 文档/doc.bin", content)
+        expected = digest_of(content)
+        nri.run_all(
+            self,
+            args=lambda p: ["verify-digest", str(p), expected],
+            regular_path=path,
+            expected_stdout=b"match\n",
+            valid_payload=content,
+            tmp=self.tmp,
+        )
+
+    @nri.requires_toctou_preload
+    def test_file_swapped_to_fifo_after_check_is_judged_on_opened_object(self):
+        # The well-formed expected digest even equals the digest of the bytes
+        # waiting in the FIFO: still the swapped input must be refused with
+        # exit 1, never match/mismatch, and never block on the pipe.
+        payload = make_content(5000)
+        nri.run_toctou_all(
+            self,
+            args=lambda p: ["verify-digest", str(p), digest_of(payload)],
+            valid_payload=payload,
+            tmp=self.tmp,
+        )
+
+    @nri.requires_nonregular_input
+    def test_malformed_digest_with_fifo_path_is_usage_error_without_opening(self):
+        # Argument validation keeps priority over the file: a bad expected
+        # digest is a usage error even when the path names a FIFO, and the
+        # FIFO must never be opened (which would otherwise risk blocking).
+        fifo = self.tmp / "order.fifo"
+        nri.make_fifo(fifo)
+        # No writer exists: an implementation that opened the file first
+        # would either block here or report a file error; either is wrong.
+        result = self.run_verify(str(fifo), "not-a-digest")
+        self.assertUsageError(result)
 
     @unittest.skipIf(
         hasattr(os, "geteuid") and os.geteuid() == 0,
