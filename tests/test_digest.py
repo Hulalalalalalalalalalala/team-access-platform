@@ -16,6 +16,12 @@ The digest contract under test (see README):
   delivering part of its raw bytes: exit code 1, empty stdout, stderr says
   the read failed and names the path -- distinct from normal EOF, where the
   final short read (and an empty file) is still a success;
+* a read() interrupted by a signal (EINTR) -- before any byte arrived or
+  after partial content, once or several times in a row, with short reads
+  around it -- is retried transparently: the digest still covers the
+  complete raw bytes from start to finish and is byte-identical to an
+  uninterrupted run, while a genuine I/O error after an interruption is
+  still the read failure above;
 * missing or empty path argument (and other usage errors): exit code 2
   with the usage text on stderr.
 
@@ -26,6 +32,15 @@ It needs no privileges, does not mutate the file, and does not depend on
 timing. Its path arrives in $SEALMARK_READFAIL_PRELOAD from CTest; the
 injector-based tests skip if it is unavailable, and fail loudly (never pass
 silently) if the fault does not actually take effect.
+
+The interrupted-read cases use a second LD_PRELOAD injector
+(tests/eintr_preload.c, $SEALMARK_EINTR_PRELOAD) that replays a scripted
+per-read schedule on one selected regular file: EINTR interruptions (no
+data delivered), short reads, and -- for the failure test -- a genuine EIO
+after the interruptions. The injector records how many interrupts it
+actually injected and how far the schedule was consumed, and the tests
+assert those counters, so a regression can never hide behind a schedule
+that silently never fired.
 
 All test content and paths are created by the tests themselves inside a
 fresh temporary directory, so the suite is independent of the working
@@ -54,9 +69,18 @@ SEALMARK_BIN = os.environ.get("SEALMARK_BIN")
 # Path to the LD_PRELOAD fault injector built by CMake (Linux only).
 READFAIL_PRELOAD = os.environ.get("SEALMARK_READFAIL_PRELOAD")
 
+# Path to the LD_PRELOAD read-interrupt injector built by CMake (Linux only).
+EINTR_PRELOAD = os.environ.get("SEALMARK_EINTR_PRELOAD")
+
 requires_readfail_preload = unittest.skipUnless(
     READFAIL_PRELOAD and Path(READFAIL_PRELOAD).is_file(),
     "SEALMARK_READFAIL_PRELOAD is unavailable; mid-read failure cannot be "
+    "injected on this platform",
+)
+
+requires_eintr_preload = unittest.skipUnless(
+    EINTR_PRELOAD and Path(EINTR_PRELOAD).is_file(),
+    "SEALMARK_EINTR_PRELOAD is unavailable; read interrupts cannot be "
     "injected on this platform",
 )
 
@@ -117,9 +141,8 @@ class SealmarkDigestTest(unittest.TestCase):
     def run_digest(self, path_arg):
         return self.run_sealmark("digest", path_arg)
 
-    def _preload_env(self, **extra):
+    def _preload_env(self, preload, **extra):
         env = dict(os.environ)
-        preload = READFAIL_PRELOAD
         if env.get("LD_PRELOAD"):
             preload = preload + ":" + env["LD_PRELOAD"]
         env["LD_PRELOAD"] = preload
@@ -130,6 +153,7 @@ class SealmarkDigestTest(unittest.TestCase):
         """Run digest with the preloaded injector armed: read() on `path`
         fails with EIO once `after` bytes have been delivered."""
         env = self._preload_env(
+            READFAIL_PRELOAD,
             SEALMARK_READFAIL_PATH=str(path),
             SEALMARK_READFAIL_AFTER=str(after),
         )
@@ -150,8 +174,41 @@ class SealmarkDigestTest(unittest.TestCase):
         return subprocess.run(
             [SEALMARK_BIN, "digest", str(path)],
             capture_output=True,
-            env=self._preload_env(**extra),
+            env=self._preload_env(READFAIL_PRELOAD, **extra),
         )
+
+    def run_digest_with_eintr(self, path, schedule):
+        """Run digest with the read-interrupt injector replaying `schedule`
+        (a comma-separated string of E / S<n> / F directives, see
+        tests/eintr_preload.c) on the reads of `path`.
+
+        Returns (result, eintr_count, target_reads, directives_consumed)
+        where the counters come from the injector's own exit-time stats
+        file, so every test can prove the scripted interrupts genuinely
+        happened rather than silently never firing."""
+        stats_fd, stats_path = tempfile.mkstemp(
+            prefix="eintr-stats-", dir=self.tmp
+        )
+        os.close(stats_fd)
+        env = self._preload_env(
+            EINTR_PRELOAD,
+            SEALMARK_EINTR_PATH=str(path),
+            SEALMARK_EINTR_SCHEDULE=schedule,
+            SEALMARK_EINTR_STATS=stats_path,
+        )
+        result = subprocess.run(
+            [SEALMARK_BIN, "digest", str(path)],
+            capture_output=True,
+            env=env,
+        )
+        counters = Path(stats_path).read_text(encoding="ascii").split()
+        self.assertEqual(
+            len(counters), 3,
+            "EINTR injector wrote no stats; the preload is not active and "
+            "the scheduled interrupts never happened",
+        )
+        eintr_count, target_reads, consumed = (int(c) for c in counters)
+        return result, eintr_count, target_reads, consumed
 
     def write_file(self, relative_path, content):
         path = self.tmp / relative_path
@@ -378,6 +435,7 @@ class SealmarkDigestTest(unittest.TestCase):
         other = self.write_file("iso/other.bin",
                                 make_content(CHUNK_SIZE + 7))
         env = self._preload_env(
+            READFAIL_PRELOAD,
             SEALMARK_READFAIL_PATH=str(target),
             SEALMARK_READFAIL_AFTER="10",
         )
@@ -391,6 +449,189 @@ class SealmarkDigestTest(unittest.TestCase):
         self.assertEqual(result.stderr, b"")
         self.assertEqual(result.stdout,
                          expected_output(make_content(CHUNK_SIZE + 7)))
+
+    # -- interrupted reads (EINTR) then recovery -------------------------
+    #
+    # read() on a regular file may return -1/EINTR when a signal arrives
+    # before any data is transferred; the file position is unchanged and
+    # the next read sees the same bytes. The digest must still cover the
+    # file's complete raw bytes from start to finish -- never the digest of
+    # the prefix read so far -- and must come out byte-identical to an
+    # uninterrupted run of the same file. The eintr injector replays a
+    # scripted schedule of interrupts/short reads and reports how many
+    # interrupts it actually injected; every test asserts those counters so
+    # the condition under test is proven to have occurred.
+
+    def assert_interrupted_digest_matches(self, path, content, schedule):
+        """Digest of `path` under the interrupt `schedule` must equal the
+        digest of an uninterrupted run of the same file (and of hashlib),
+        with the schedule's interrupts proven to have actually fired."""
+        expected_eintr = schedule.split(",").count("E")
+        schedule_len = len(schedule.split(","))
+
+        # Control: the same file with no injector involved at all.
+        normal = self.run_digest(str(path))
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertEqual(normal.stderr, b"")
+        self.assertEqual(normal.stdout, expected_output(content))
+
+        result, eintr_count, target_reads, consumed = (
+            self.run_digest_with_eintr(path, schedule)
+        )
+
+        # The scripted interrupts really happened and the schedule was
+        # replayed in full before EOF -- otherwise this test proves nothing.
+        self.assertEqual(eintr_count, expected_eintr)
+        self.assertEqual(consumed, schedule_len)
+        self.assertGreaterEqual(target_reads, schedule_len)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertRegex(result.stdout, OUTPUT_RE)
+        # The complete raw bytes, start to finish -- checked against an
+        # independent SHA-256, not merely against another sealmark run.
+        self.assertEqual(result.stdout, expected_output(content))
+        # ... and byte-identical to the uninterrupted run of the same file.
+        self.assertEqual(result.stdout, normal.stdout)
+        # The operation must not rewrite the file it digests.
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_eintr_on_the_very_first_read_still_yields_full_digest(self):
+        # The interrupt arrives before a single byte has been read; the
+        # file crosses a chunk boundary so several reads follow the retry.
+        content = make_content(CHUNK_SIZE + 7)
+        path = self.write_file("eintr/first-read 中断.bin", content)
+
+        self.assert_interrupted_digest_matches(path, content, "E")
+
+    @requires_eintr_preload
+    def test_eintr_after_partial_content_still_yields_full_digest(self):
+        # Some bytes are already delivered (a short read), then the next
+        # read is interrupted; the digest must still run to the real EOF,
+        # not stop at -- or restart from -- the interruption point.
+        content = make_content(2 * CHUNK_SIZE + 13)
+        path = self.write_file("eintr/mid-stream 文档.bin", content)
+
+        # The content genuinely is the binary case: NUL bytes, line feeds
+        # and high bytes, spread over more than one chunk.
+        self.assertIn(b"\x00", content)
+        self.assertIn(b"\n", content)
+        self.assertTrue(any(byte > 0x7F for byte in content))
+        self.assertGreater(len(content), CHUNK_SIZE)
+
+        self.assert_interrupted_digest_matches(path, content, "S1000,E")
+
+    @requires_eintr_preload
+    def test_consecutive_eintrs_then_recovery_yields_full_digest(self):
+        # Several interrupts in a row, mid-stream, before reads resume:
+        # the result is the full file's SHA-256, not the prefix read so far.
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("eintr/consecutive.bin", content)
+
+        self.assert_interrupted_digest_matches(path, content, "S4096,E,E,E")
+
+    @requires_eintr_preload
+    def test_short_reads_around_interrupts_are_not_mistaken_for_eof(self):
+        # A read returning fewer bytes than requested -- including a single
+        # byte -- is not EOF while content remains. Short reads before,
+        # after and between interrupts must all be accumulated, and the
+        # final tail of the file must be included exactly once.
+        content = make_content(CHUNK_SIZE + 300)
+        path = self.write_file("eintr/short-reads.bin", content)
+
+        self.assert_interrupted_digest_matches(
+            path, content, "S1,E,S7,S64,E,S8192"
+        )
+
+    @requires_eintr_preload
+    def test_empty_file_with_interrupted_first_read_has_empty_digest(self):
+        # Even for an empty file, an interrupt on the first read is
+        # retried; the following normal EOF yields the standard empty
+        # digest, not a read failure.
+        path = self.write_file("eintr/empty.bin", b"")
+
+        result, eintr_count, _, consumed = self.run_digest_with_eintr(
+            path, "E"
+        )
+
+        self.assertEqual(eintr_count, 1)
+        self.assertEqual(consumed, 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            result.stdout, f"sha256:{EMPTY_FILE_SHA256}\n".encode("ascii")
+        )
+        self.assertEqual(path.read_bytes(), b"")
+
+    @requires_eintr_preload
+    def test_eintr_recovery_then_genuine_read_error_fails(self):
+        # Interrupts are retried, but a genuine I/O error once reads have
+        # resumed is still a read failure -- even though partial content
+        # was already delivered successfully. No prefix digest and no
+        # success output may be produced.
+        content = make_content(2 * CHUNK_SIZE + 17)
+        path = self.write_file("eintr/then-eio.bin", content)
+
+        # Control first: without the final EIO the very same interruption
+        # schedule recovers and digests the complete file.
+        healthy, eintr_count, _, _ = self.run_digest_with_eintr(
+            path, "S500,E"
+        )
+        self.assertEqual(eintr_count, 1)
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        self.assertEqual(healthy.stdout, expected_output(content))
+
+        result, eintr_count, _, consumed = self.run_digest_with_eintr(
+            path, "S500,E,F"
+        )
+
+        # The interrupt fired and was survived; the subsequent genuine
+        # error is what failed the run.
+        self.assertEqual(eintr_count, 1)
+        self.assertEqual(consumed, 3)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        stderr = result.stderr
+        self.assertTrue(stderr.endswith(b"\n"))
+        # A read failure (not an open or usage failure) naming the path
+        # exactly as passed; no digest or success line anywhere.
+        self.assertIn(b"read", stderr.lower())
+        self.assertNotIn(b"Usage", stderr)
+        self.assertIn(os.fsencode(str(path)), stderr)
+        self.assertNotIn(b"sha256:", stderr)
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_eintr_injector_only_affects_the_target_file(self):
+        target = self.write_file("eintr-iso/target.bin",
+                                 make_content(CHUNK_SIZE + 7))
+        other = self.write_file("eintr-iso/other.bin",
+                                make_content(CHUNK_SIZE + 7))
+        stats_fd, stats_path = tempfile.mkstemp(
+            prefix="eintr-stats-", dir=self.tmp
+        )
+        os.close(stats_fd)
+        env = self._preload_env(
+            EINTR_PRELOAD,
+            SEALMARK_EINTR_PATH=str(target),
+            SEALMARK_EINTR_SCHEDULE="E,E",
+            SEALMARK_EINTR_STATS=stats_path,
+        )
+        result = subprocess.run(
+            [SEALMARK_BIN, "digest", str(other)],
+            capture_output=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout,
+                         expected_output(make_content(CHUNK_SIZE + 7)))
+        # No interrupt was injected: the scheduled directives stayed
+        # unconsumed because the target file was never read.
+        counters = Path(stats_path).read_text(encoding="ascii").split()
+        self.assertEqual(int(counters[0]), 0)
 
     # -- usage failures (exit code 2) ------------------------------------
 

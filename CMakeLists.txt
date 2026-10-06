@@ -28,6 +28,13 @@ enable_testing()
 # open() untouched, so the "file type is decided on the object actually
 # opened, not on a separate stat of the path" rule can be tested without a
 # real check/open race.
+#
+# A third preload (SEALMARK_EINTR_PRELOAD) replays a scripted schedule of
+# EINTR interruptions, short reads and a final genuine I/O error on the
+# reads of one chosen regular file, so the "read() interrupted by a signal,
+# then resumed" paths can be tested deterministically without signals or
+# timing. It also records how many interrupts it actually injected, letting
+# the tests prove the condition under test really occurred.
 set(SEALMARK_TEST_ENV "SEALMARK_BIN=$<TARGET_FILE:sealmark>")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)
@@ -51,10 +58,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
     target_link_libraries(sealmark_toctou_preload PRIVATE ${CMAKE_DL_LIBS})
 
+    add_library(sealmark_eintr_preload MODULE tests/eintr_preload.c)
+    set_target_properties(
+        sealmark_eintr_preload
+        PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        PREFIX ""
+        C_STANDARD 11
+    )
+    target_link_libraries(sealmark_eintr_preload PRIVATE ${CMAKE_DL_LIBS})
+
     list(
         APPEND SEALMARK_TEST_ENV
         "SEALMARK_READFAIL_PRELOAD=$<TARGET_FILE:sealmark_readfail_preload>"
         "SEALMARK_TOCTOU_PRELOAD=$<TARGET_FILE:sealmark_toctou_preload>"
+        "SEALMARK_EINTR_PRELOAD=$<TARGET_FILE:sealmark_eintr_preload>"
     )
 endif()
 
