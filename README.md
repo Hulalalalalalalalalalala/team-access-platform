@@ -11,8 +11,37 @@ cmake -S . -B build
 cmake --build build
 ```
 
-依赖：C++20 编译器与 OpenSSL（libcrypto）。若 OpenSSL 不在系统默认路径，
-可通过 `OPENSSL_ROOT_DIR` 或 `PKG_CONFIG_PATH` 提示其位置。
+默认构建只需要：
+
+- 支持 C++20 的编译器（构建过程中不需要 C 编译器）；
+- OpenSSL 开发文件（libcrypto 的头文件与库）。
+
+若 OpenSSL 不在系统默认路径，可通过 `OPENSSL_ROOT_DIR` 或
+`PKG_CONFIG_PATH` 提示其位置；缺少 OpenSSL 时配置会直接失败。默认构建
+不会查找 Python，也不会构建任何测试辅助内容。
+
+### 运行回归测试
+
+回归测试默认关闭。需要时在配置阶段显式开启：
+
+```sh
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build
+```
+
+开启测试需要额外准备：
+
+- Python 3 解释器；如需指定解释器，可用 `-DPython3_EXECUTABLE=/路径/python3`，
+  测试只会使用配置时选定的这个解释器；
+- 该解释器环境中可导入的 Python [cryptography](https://pypi.org/project/cryptography/)
+  包（`key-id` 测试用它独立生成和解析公钥）；
+- 在 Linux 上还需要可用的 C 编译器，用于构建读取故障、读取中断与文件
+  类型检查的测试辅助库；其他平台会按现有规则自动跳过这些辅助场景。
+
+若缺少上述任何一项，配置阶段就会失败并说明缺的是什么；不想准备测试
+环境时，不开启 `BUILD_TESTING`（或显式设为 `-DBUILD_TESTING=OFF`）即可
+照常只构建 sealmark 程序本身。
 
 ## 用法
 
