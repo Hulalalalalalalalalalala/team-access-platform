@@ -4,8 +4,9 @@ project(sealmark VERSION 0.1.0 LANGUAGES CXX)
 # Building the sealmark program never requires anything beyond a C++20
 # compiler and the OpenSSL development files below. The regression tests and
 # their auxiliary content (a Python interpreter plus the Python cryptography
-# package, and on Linux three small C LD_PRELOAD fault injectors) are prepared
-# only when tests are explicitly enabled.
+# package, and on Linux three small C LD_PRELOAD fault injectors plus one
+# resource-usage reporter) are prepared only when tests are explicitly
+# enabled.
 option(BUILD_TESTING "Build the regression tests and their helper libraries" OFF)
 
 add_executable(sealmark src/main.cpp)
@@ -95,7 +96,8 @@ if(BUILD_TESTING)
                 "BUILD_TESTING=ON on Linux requires a C compiler to build "
                 "the test fault-injection helper libraries "
                 "(tests/readfail_preload.c, tests/eintr_preload.c and "
-                "tests/toctou_preload.c), but no usable C compiler was "
+                "tests/toctou_preload.c) and the resource-usage reporter "
+                "(tests/rusage_wrap.c), but no usable C compiler was "
                 "found. Install one (for example gcc), point "
                 "-DCMAKE_C_COMPILER at it, or reconfigure without "
                 "-DBUILD_TESTING=ON (or with -DBUILD_TESTING=OFF) to build "
@@ -132,11 +134,27 @@ if(BUILD_TESTING)
         )
         target_link_libraries(sealmark_toctou_preload PRIVATE ${CMAKE_DL_LIBS})
 
+        # The resource-usage reporter used by the key-id bounded-memory
+        # regression: a plain executable that forks, execs sealmark, reaps it
+        # with wait4() and writes the child's own peak resident set size
+        # (ru_maxrss) and exit status to a report file. It is the same clean
+        # per-child signal /usr/bin/time -v reports; a Python driver cannot
+        # read it about its own grandchild without contamination. Its location
+        # is handed to the Python tests through SEALMARK_RUSAGE_WRAP; when
+        # unset (non-Linux) the bounded-memory tests skip themselves.
+        add_executable(sealmark_rusage_wrap tests/rusage_wrap.c)
+        set_target_properties(
+            sealmark_rusage_wrap
+            PROPERTIES
+            C_STANDARD 11
+        )
+
         list(
             APPEND SEALMARK_TEST_ENV
             "SEALMARK_READFAIL_PRELOAD=$<TARGET_FILE:sealmark_readfail_preload>"
             "SEALMARK_TOCTOU_PRELOAD=$<TARGET_FILE:sealmark_toctou_preload>"
             "SEALMARK_EINTR_PRELOAD=$<TARGET_FILE:sealmark_eintr_preload>"
+            "SEALMARK_RUSAGE_WRAP=$<TARGET_FILE:sealmark_rusage_wrap>"
         )
     endif()
 
