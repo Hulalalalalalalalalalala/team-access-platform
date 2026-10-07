@@ -21,6 +21,16 @@ The key-id contract under test (see README):
 * the fingerprint is independently recomputed here with hashlib over the DER
   obtained from the cryptography package, and one Ed25519 case is pinned to a
   known answer;
+* peak memory use does not grow with the amount of legal whitespace
+  surrounding the block: the same key padded with megabytes of ASCII
+  whitespace -- before, after or on both sides -- is fingerprinted within a
+  fixed peak-RSS slack of the unpadded key, measured per process through
+  RUSAGE_CHILDREN inside a one-shot helper interpreter (so the measurement
+  is attributable to a single sealmark run). A regression that accumulates
+  the whole file in memory would leave every output byte unchanged, so only
+  this direct measurement catches it. The whitespace-only and
+  garbage-after-long-whitespace rejections hold the same bound while still
+  scanning the file to its very end;
 * the file must contain exactly one PEM block wrapped in the literal
   ``PUBLIC KEY`` label, with only ASCII whitespace before or after it. Empty
   files, damaged/truncated encodings, non-canonical base64, more than one key,
@@ -61,13 +71,20 @@ the tests themselves inside a fresh temporary directory.
 import base64
 import datetime
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # e.g. Windows: peak RSS cannot be measured there
+    resource = None
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -96,6 +113,32 @@ requires_eintr_preload = unittest.skipUnless(
     "SEALMARK_EINTR_PRELOAD is unavailable; read interruption cannot be "
     "injected on this platform",
 )
+
+# The memory-regression tests measure the peak RSS of the sealmark process
+# through resource.getrusage(); where the module does not exist the
+# measurement is impossible and the tests skip.
+requires_rusage = unittest.skipUnless(
+    resource is not None,
+    "the resource module is unavailable on this platform; the peak RSS of "
+    "the key-id process cannot be measured",
+)
+
+# Total legal surrounding whitespace used by the memory-regression tests:
+# far larger than any supported public key, and large enough that a
+# regression accumulating the input -- or just its surrounding whitespace --
+# in memory would grow the peak RSS by many MiB. It must also be large
+# compared to the measurement floor described at
+# run_key_id_measuring_peak_rss: the helper interpreter's own resident set
+# (a fresh Python process, on the order of 10 MiB) is a lower bound for
+# every ru_maxrss it reports, so only growth clearly beyond that floor is
+# attributable to the sealmark process itself.
+WS_MEMORY_PADDING = 32 * 1024 * 1024
+
+# Allowed peak-RSS increase over the same key file without padding. Generous
+# against allocator, loader and interpreter noise, but a small fraction of
+# WS_MEMORY_PADDING, so any per-input-byte growth trips it even after the
+# measurement floor has absorbed its share.
+WS_MEMORY_SLACK = 4 * 1024 * 1024
 
 OUTPUT_RE = re.compile(rb"\Aspki-sha256:[0-9a-f]{64}\n\Z")
 
@@ -859,6 +902,160 @@ class SealmarkKeyIdTest(unittest.TestCase):
                 content = ascii_whitespace(CHUNK_SIZE - (len(head) - 1)) + head
                 path = self.write_file(f"multi/trunc-body/{i}.pub", content)
                 self.assertRejected(self.run_key_id(str(path)), path)
+
+    # -- memory use is independent of the surrounding whitespace -----------
+    #
+    # The parser classifies and discards the surrounding ASCII whitespace
+    # byte by byte; nothing but the decoded public key is retained. A
+    # regression that accumulates the whole file (or just the whitespace
+    # run) in memory would leave every output byte unchanged, so none of the
+    # fingerprint checks above can catch it. These tests therefore measure
+    # the peak resident set size of a sealmark process whose input is mostly
+    # legal padding and require it to stay within a fixed slack of the same
+    # key without any padding -- for both RSA and Ed25519, and also for the
+    # rejection paths that must still scan the file to its very end. The
+    # comparison is always between two sizes of *padding around one key*;
+    # keys of different sizes are never required to use identical memory.
+
+    def run_key_id_measuring_peak_rss(self, path_arg):
+        """Run key-id once and report the sealmark process's peak RSS.
+
+        ru_maxrss of RUSAGE_CHILDREN is the maximum over every child a
+        process has ever waited for, so the measurement runs inside a fresh
+        one-shot helper interpreter whose only child is this single sealmark
+        invocation; the reported peak is then attributable to that run
+        alone. Note the reported value has a floor: between fork/spawn and
+        exec the child is charged for the helper interpreter's own resident
+        set, so readings never drop below roughly the helper's size. The
+        floor is identical for every measurement, so differences between two
+        runs still track the sealmark process's own growth once that growth
+        exceeds the floor -- which is why WS_MEMORY_PADDING is large.
+        Returns a (CompletedProcess, peak_rss_bytes) pair.
+        """
+        helper = (
+            "import json, resource, subprocess, sys\n"
+            "r = subprocess.run(sys.argv[1:], capture_output=True)\n"
+            "json.dump({\n"
+            "    'rc': r.returncode,\n"
+            "    'out': r.stdout.decode('latin-1'),\n"
+            "    'err': r.stderr.decode('latin-1'),\n"
+            "    'rss': resource.getrusage("
+            "resource.RUSAGE_CHILDREN).ru_maxrss,\n"
+            "}, sys.stdout)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", helper, SEALMARK_BIN, "key-id", path_arg],
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        report = json.loads(proc.stdout.decode("ascii"))
+        result = subprocess.CompletedProcess(
+            [SEALMARK_BIN, "key-id", path_arg],
+            report["rc"],
+            report["out"].encode("latin-1"),
+            report["err"].encode("latin-1"),
+        )
+        # ru_maxrss is counted in KiB on Linux and in bytes on macOS.
+        rss_bytes = report["rss"] * (1 if sys.platform == "darwin" else 1024)
+        return result, rss_bytes
+
+    def assert_peak_rss_bounded(self, baseline_rss, measured_rss, context):
+        self.assertLessEqual(
+            measured_rss - baseline_rss,
+            WS_MEMORY_SLACK,
+            f"peak RSS grew by {measured_rss - baseline_rss} bytes for "
+            f"{context} with {WS_MEMORY_PADDING} bytes of surrounding "
+            f"whitespace (slack {WS_MEMORY_SLACK}); the input or its "
+            "whitespace is being accumulated in memory",
+        )
+
+    @requires_rusage
+    def test_memory_does_not_grow_with_surrounding_whitespace(self):
+        for key_name, der, pem in (
+            ("rsa", self.rsa_der, self.rsa_pem),
+            ("ed25519", self.ed_der, self.ed_pem),
+        ):
+            with self.subTest(key=key_name):
+                bare = self.write_file(f"mem/{key_name}/bare.pub", pem)
+                bare_result, bare_rss = self.run_key_id_measuring_peak_rss(
+                    str(bare)
+                )
+                self.assertFingerprintOk(bare_result, der)
+
+                half = WS_MEMORY_PADDING // 2
+                variants = {
+                    "pad-before.pub":
+                        ascii_whitespace(WS_MEMORY_PADDING) + pem,
+                    "pad-after.pub":
+                        pem + ascii_whitespace(WS_MEMORY_PADDING),
+                    "pad-both.pub":
+                        ascii_whitespace(half) + pem
+                        + ascii_whitespace(half),
+                }
+                for name, content in variants.items():
+                    with self.subTest(key=key_name, variant=name):
+                        # The padding dwarfs the key itself, so any
+                        # per-input-byte accumulation is unmistakable.
+                        self.assertGreater(
+                            WS_MEMORY_PADDING, 10 * len(pem)
+                        )
+                        path = self.write_file(
+                            f"mem/{key_name}/{name}", content
+                        )
+                        result, rss = self.run_key_id_measuring_peak_rss(
+                            str(path)
+                        )
+                        # The fingerprint is still exactly the independently
+                        # computed SPKI SHA-256 -- but output alone cannot
+                        # prove the memory behavior; the RSS bound does.
+                        self.assertFingerprintOk(result, der)
+                        self.assert_peak_rss_bounded(
+                            bare_rss, rss, f"{key_name}/{name}"
+                        )
+
+    @requires_rusage
+    def test_garbage_after_huge_trailing_whitespace_is_rejected_at_eof(self):
+        # The scan must reach the very last byte: a complete, valid PUBLIC
+        # KEY block followed by a long run of legal whitespace and only then
+        # a single non-whitespace byte is an invalid public key file.
+        # Accepting the key at its END marker would print the fingerprint
+        # before the stray byte is ever seen; stdout must stay empty.
+        for key_name, der, pem in (
+            ("rsa", self.rsa_der, self.rsa_pem),
+            ("ed25519", self.ed_der, self.ed_pem),
+        ):
+            with self.subTest(key=key_name):
+                bare = self.write_file(f"mem-eof/{key_name}/bare.pub", pem)
+                bare_result, bare_rss = self.run_key_id_measuring_peak_rss(
+                    str(bare)
+                )
+                self.assertFingerprintOk(bare_result, der)
+
+                content = pem + ascii_whitespace(WS_MEMORY_PADDING) + b"x"
+                path = self.write_file(
+                    f"mem-eof/{key_name}/trailing-garbage.pub", content
+                )
+                result, rss = self.run_key_id_measuring_peak_rss(str(path))
+                self.assertInvalidPublicKey(result, path)
+                self.assert_peak_rss_bounded(
+                    bare_rss, rss, f"{key_name}/trailing-garbage"
+                )
+
+    @requires_rusage
+    def test_huge_whitespace_only_file_is_rejected_without_buffering(self):
+        # Megabytes of legal whitespace and no public key at all: the same
+        # invalid-public-key failure as for a short whitespace-only file,
+        # and the scan must not accumulate the whitespace while finding out.
+        bare = self.write_file("mem-ws-only/bare.pub", self.ed_pem)
+        bare_result, bare_rss = self.run_key_id_measuring_peak_rss(str(bare))
+        self.assertFingerprintOk(bare_result, self.ed_der)
+
+        path = self.write_file(
+            "mem-ws-only/ws-only.pub", ascii_whitespace(WS_MEMORY_PADDING)
+        )
+        result, rss = self.run_key_id_measuring_peak_rss(str(path))
+        self.assertInvalidPublicKey(result, path)
+        self.assert_peak_rss_bounded(bare_rss, rss, "whitespace-only")
 
     # -- invalid content (exit code 1) -----------------------------------
 
