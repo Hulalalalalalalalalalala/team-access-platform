@@ -21,15 +21,30 @@ The verify-digest contract under test (see README):
   stderr names the read failure and the path, and neither ``match`` nor
   ``mismatch`` is printed -- even if the expected digest happens to equal
   the digest of the bytes delivered before the error. Normal EOF (including
-  a final short read and an empty file) is not an error and still matches.
+  a final short read and an empty file) is not an error and still matches;
+* a read() interrupted by a signal (EINTR) before delivering data is
+  retried: whether it happens before the first byte, after partial content,
+  or several times in a row -- and even when interleaved with short reads
+  that return only a few bytes while more content remains -- the verdict is
+  still computed from the file's complete raw bytes exactly once, so the
+  full-content digest matches and any well-formed but different digest
+  (including the digest of a mere prefix) mismatches; an interrupted empty
+  file still matches the standard empty digest. Only a genuine I/O error
+  after the interrupts is a read failure (exit code 1) -- never a match,
+  even against the digest of exactly the bytes delivered before the error.
 
 The read-failure case is produced deterministically by a small LD_PRELOAD
 fault injector (tests/readfail_preload.c) that makes read() return EIO on
 one selected regular file after an exact number of bytes have been read.
-It needs no privileges, does not mutate the file, and does not depend on
-timing. Its path arrives in $SEALMARK_READFAIL_PRELOAD from CTest; the
-injector-based tests skip if it is unavailable, and fail loudly (never pass
-silently) if the fault does not actually take effect.
+The interruption cases use a second injector (tests/eintr_preload.c) that
+returns EINTR a chosen number of times at a chosen byte position, can clip
+reads to a short size, and can switch to a genuine EIO afterwards; it writes
+a counters report so the tests can prove the staged conditions actually
+occurred. Neither injector needs privileges, mutates the file, or depends
+on timing. Their paths arrive in $SEALMARK_READFAIL_PRELOAD and
+$SEALMARK_EINTR_PRELOAD from CTest; the injector-based tests skip if one is
+unavailable, and fail loudly (never pass silently) if a fault does not
+actually take effect.
 
 All test content and paths are created inside a fresh temporary directory.
 The executable path comes from $SEALMARK_BIN (wired up by CTest).
@@ -56,6 +71,15 @@ READFAIL_PRELOAD = os.environ.get("SEALMARK_READFAIL_PRELOAD")
 requires_readfail_preload = unittest.skipUnless(
     READFAIL_PRELOAD and Path(READFAIL_PRELOAD).is_file(),
     "SEALMARK_READFAIL_PRELOAD is unavailable; mid-read failure cannot be "
+    "injected on this platform",
+)
+
+# Path to the LD_PRELOAD EINTR/short-read injector built by CMake (Linux only).
+EINTR_PRELOAD = os.environ.get("SEALMARK_EINTR_PRELOAD")
+
+requires_eintr_preload = unittest.skipUnless(
+    EINTR_PRELOAD and Path(EINTR_PRELOAD).is_file(),
+    "SEALMARK_EINTR_PRELOAD is unavailable; read interruption cannot be "
     "injected on this platform",
 )
 
@@ -108,9 +132,8 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
     def run_verify(self, path_arg, digest_arg):
         return self.run_sealmark("verify-digest", path_arg, digest_arg)
 
-    def _preload_env(self, **extra):
+    def _preload_env(self, preload, **extra):
         env = dict(os.environ)
-        preload = READFAIL_PRELOAD
         if env.get("LD_PRELOAD"):
             preload = preload + ":" + env["LD_PRELOAD"]
         env["LD_PRELOAD"] = preload
@@ -121,6 +144,7 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         """verify-digest with the injector armed: read() on `path` fails
         with EIO once `after` bytes have been delivered."""
         env = self._preload_env(
+            READFAIL_PRELOAD,
             SEALMARK_READFAIL_PATH=str(path),
             SEALMARK_READFAIL_AFTER=str(after),
         )
@@ -136,8 +160,43 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         return subprocess.run(
             [SEALMARK_BIN, "verify-digest", str(path), digest_arg],
             capture_output=True,
-            env=self._preload_env(SEALMARK_READFAIL_PATH=str(path)),
+            env=self._preload_env(
+                READFAIL_PRELOAD, SEALMARK_READFAIL_PATH=str(path)
+            ),
         )
+
+    def run_verify_with_eintr(self, path, digest_arg, report, **knobs):
+        """verify-digest with the preloaded EINTR injector armed on `path`.
+        Knobs map to the injector's environment: `at` (byte position of the
+        first interrupt), `times` (consecutive EINTR results), `short`
+        (per-read byte cap) and `eio_after` (byte position of a genuine
+        EIO). `report` is the path the injector writes its counters to, so
+        the test can prove the staged conditions actually occurred."""
+        extra = {"SEALMARK_EINTR_PATH": str(path),
+                 "SEALMARK_EINTR_REPORT": str(report)}
+        for knob, value in knobs.items():
+            extra[f"SEALMARK_EINTR_{knob.upper()}"] = str(value)
+        return subprocess.run(
+            [SEALMARK_BIN, "verify-digest", str(path), digest_arg],
+            capture_output=True,
+            env=self._preload_env(EINTR_PRELOAD, **extra),
+        )
+
+    def read_eintr_report(self, report_path):
+        """Parse the injector's counters file. A missing report means the
+        preload never took effect, which must fail the test rather than let
+        it pass on an unstaged condition."""
+        self.assertTrue(
+            report_path.is_file(),
+            f"EINTR injector wrote no report to {report_path}; "
+            "the preload did not take effect",
+        )
+        fields = {}
+        for line in report_path.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            self.assertTrue(sep, f"malformed report line: {line!r}")
+            fields[key] = int(value)
+        return fields
 
     def write_file(self, relative_path, content):
         path = self.tmp / relative_path
@@ -461,6 +520,7 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         other = self.write_file("iso/other.bin",
                                 make_content(CHUNK_SIZE + 7))
         env = self._preload_env(
+            READFAIL_PRELOAD,
             SEALMARK_READFAIL_PATH=str(target),
             SEALMARK_READFAIL_AFTER="10",
         )
@@ -474,6 +534,200 @@ class SealmarkVerifyDigestTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b"match\n")
         self.assertEqual(result.stderr, b"")
+
+    # -- read interruption (EINTR) is retried, never fatal or final ------
+    #
+    # read() may return -1/EINTR without delivering any data; that is a
+    # transient condition, not EOF and not a mismatch. The verdict must
+    # still be computed from the file's complete raw bytes exactly once --
+    # whether the interrupt arrives before the first byte, after partial
+    # content, or several times in a row, and even when interleaved with
+    # short reads -- and must agree with an uninterrupted run of the same
+    # file. The EINTR injector stages this deterministically and writes a
+    # counters report; every test here asserts on those counters so a
+    # missing retry, a premature end, or content replayed on resume cannot
+    # pass silently.
+
+    @requires_eintr_preload
+    def test_eintr_before_first_byte_still_matches_complete_content(self):
+        content = make_content(2 * CHUNK_SIZE + 13)
+        path = self.write_file("eintr/first-read.bin", content)
+
+        # Control: the same file without any injection.
+        self.assertMatch(self.run_verify(str(path), digest_of(content)))
+
+        report = self.tmp / "eintr/first-read.report"
+        result = self.run_verify_with_eintr(
+            path, digest_of(content), report, at=0, times=3
+        )
+
+        self.assertMatch(result)
+
+        fields = self.read_eintr_report(report)
+        # The interrupts genuinely happened, before any byte was delivered.
+        self.assertEqual(fields["eintr"], 3)
+        self.assertEqual(fields["eintr_pos"], 0)
+        self.assertEqual(fields["eio"], 0)
+        # Every byte of the file was delivered to the digest exactly once.
+        self.assertEqual(fields["delivered"], len(content))
+        # The operation only reads the file; it must not rewrite it.
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_eintr_after_partial_content_still_matches_complete_content(self):
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("eintr/mid-file.bin", content)
+        expected = digest_of(content)
+
+        # Interrupts landing after the first byte, inside the first chunk,
+        # on a chunk boundary and well into a later chunk -- singly and in
+        # bursts of several in a row.
+        for at, times in ((1, 1), (4096, 2), (CHUNK_SIZE, 1),
+                          (CHUNK_SIZE + 4096, 3), (2 * CHUNK_SIZE + 17, 1)):
+            with self.subTest(at=at, times=times):
+                report = self.tmp / f"eintr/mid-{at}-{times}.report"
+                result = self.run_verify_with_eintr(
+                    path, expected, report, at=at, times=times
+                )
+
+                self.assertMatch(result)
+
+                fields = self.read_eintr_report(report)
+                self.assertEqual(fields["eintr"], times)
+                # The interrupts fired only after real content had already
+                # been delivered -- not at the start of the file.
+                self.assertGreaterEqual(fields["eintr_pos"], at)
+                self.assertGreater(fields["eintr_pos"], 0)
+                self.assertEqual(fields["delivered"], len(content))
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_short_reads_around_eintr_cover_every_byte_exactly_once(self):
+        # Every read returns at most 7 bytes although more content remains,
+        # with two interrupts in the middle. A short read mistaken for EOF
+        # truncates the digest; a resume that replays or drops bytes changes
+        # it too -- both are caught by the known-answer comparison.
+        content = make_content(2 * CHUNK_SIZE + 13)
+        self.assertIn(b"\x00", content)
+        self.assertIn(b"\n", content)
+        self.assertTrue(any(b > 0x7F for b in content))
+        path = self.write_file("eintr/short-reads.bin", content)
+
+        at = CHUNK_SIZE + 3
+        # The same content is verified twice under identical staging: the
+        # full-content digest must match, while the digest of the prefix
+        # delivered around the first interrupt -- well-formed but not the
+        # file's digest -- must mismatch.
+        prefix_digest = digest_of(content[:at])
+        self.assertNotEqual(prefix_digest, digest_of(content))
+
+        match_report = self.tmp / "eintr/short-reads-match.report"
+        match = self.run_verify_with_eintr(
+            path, digest_of(content), match_report, at=at, times=2, short=7
+        )
+        self.assertMatch(match)
+
+        mismatch_report = self.tmp / "eintr/short-reads-mismatch.report"
+        mismatch = self.run_verify_with_eintr(
+            path, prefix_digest, mismatch_report, at=at, times=2, short=7
+        )
+        self.assertMismatch(mismatch)
+
+        for report in (match_report, mismatch_report):
+            fields = self.read_eintr_report(report)
+            self.assertEqual(fields["eintr"], 2)
+            # The short reads genuinely happened and the whole file --
+            # head, middle and tail -- was delivered across them.
+            self.assertGreater(fields["short"], 0)
+            self.assertEqual(fields["delivered"], len(content))
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_empty_file_eintr_on_first_read_matches_standard_empty_digest(self):
+        path = self.write_file("eintr/empty.bin", b"")
+        report = self.tmp / "eintr/empty.report"
+
+        result = self.run_verify_with_eintr(
+            path, f"sha256:{EMPTY_FILE_SHA256}", report, at=0, times=2
+        )
+
+        # Interrupts before the (immediate) EOF do not turn an empty file
+        # into a failure or a mismatch.
+        self.assertMatch(result)
+
+        fields = self.read_eintr_report(report)
+        self.assertEqual(fields["eintr"], 2)
+        self.assertEqual(fields["delivered"], 0)
+
+    @requires_eintr_preload
+    def test_eintr_then_genuine_read_error_is_file_failure_not_match(self):
+        content = make_content(3 * CHUNK_SIZE + 5)
+        path = self.write_file("eintr/then-eio.bin", content)
+
+        # Control: with only the interrupts (no I/O error) the same file
+        # matches its full digest, so the failure below is attributable to
+        # the genuine read error, not to the interrupts or the setup.
+        ok_report = self.tmp / "eintr/then-eio-control.report"
+        ok = self.run_verify_with_eintr(
+            path, digest_of(content), ok_report, at=100, times=2
+        )
+        self.assertMatch(ok)
+        self.assertEqual(self.read_eintr_report(ok_report)["eintr"], 2)
+
+        # Two interrupts after partial content, a successful resume, and
+        # then a genuine I/O error once exactly two chunks have been
+        # delivered. The expected digest is the digest of precisely those
+        # delivered bytes -- well-formed and equal to the digest of
+        # everything read so far -- yet the run must still fail as a read
+        # failure, never a match.
+        delivered_before_error = 2 * CHUNK_SIZE
+        prefix_digest = digest_of(content[:delivered_before_error])
+        self.assertNotEqual(prefix_digest, digest_of(content))
+
+        report = self.tmp / "eintr/then-eio.report"
+        result = self.run_verify_with_eintr(
+            path, prefix_digest, report, at=100, times=2,
+            eio_after=delivered_before_error,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotEqual(result.stdout, b"match\n")
+        self.assertNotEqual(result.stdout, b"mismatch\n")
+        stderr = result.stderr
+        self.assertTrue(stderr.endswith(b"\n"))
+        self.assertIn(b"read", stderr.lower())
+        self.assertIn(os.fsencode(str(path)), stderr)
+        self.assertNotIn(b"match", stderr)
+        self.assertNotIn(b"mismatch", stderr)
+
+        fields = self.read_eintr_report(report)
+        # The interrupts and the genuine error both really happened, and
+        # real content was delivered before the error.
+        self.assertEqual(fields["eintr"], 2)
+        self.assertGreaterEqual(fields["eio"], 1)
+        self.assertEqual(fields["delivered"], delivered_before_error)
+        self.assertEqual(path.read_bytes(), content)
+
+    @requires_eintr_preload
+    def test_eintr_preload_loaded_but_unarmed_behaves_like_normal_read(self):
+        # The injector is loaded and pointed at the file, but no interrupt,
+        # short-read or error knob is set: reads pass straight through and
+        # normal EOF behavior (including the empty file) is unchanged.
+        for size in (0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1):
+            with self.subTest(size=size):
+                content = make_content(size)
+                path = self.write_file(f"eintr/unarmed/{size}.bin", content)
+                report = self.tmp / f"eintr/unarmed/{size}.report"
+
+                self.assertMatch(
+                    self.run_verify_with_eintr(path, digest_of(content), report)
+                )
+
+                fields = self.read_eintr_report(report)
+                self.assertEqual(fields["eintr"], 0)
+                self.assertEqual(fields["eio"], 0)
+                self.assertEqual(fields["delivered"], len(content))
 
 
 if __name__ == "__main__":
