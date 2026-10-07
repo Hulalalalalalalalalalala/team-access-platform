@@ -233,10 +233,137 @@ private:
     unsigned char hash_[kSha256Size] = {};
 };
 
+// --- key-id input handling --------------------------------------------------
+//
+// The key-id input rules are split into three independent layers, each owning
+// exactly one concern and testable in isolation:
+//
+//   1. StrictBase64Decoder -- the encoding rules for the payload characters:
+//      alphabet, quantum assembly, padding placement and canonical unused
+//      bits. It knows nothing about PEM markers, lines or whitespace.
+//   2. PublicKeyPemParser -- the PEM text rules: surrounding whitespace, the
+//      BEGIN/END markers and the line structure of the body. It decides which
+//      characters are payload and hands them to the decoder; it never
+//      inspects the base64 alphabet or assembles quanta itself.
+//   3. isCanonicalSpkiDer -- the DER rules for the decoded payload: one
+//      complete, canonical SubjectPublicKeyInfo covering every byte.
+//
+// PublicKeyPemSink then adapts the parser to the ByteSink interface used by
+// processFileChunks and owns the key-id error reporting.
+
+// --- Layer 1: strict canonical Base64 decoding ------------------------------
+//
+// Incremental decoder for the payload of a PEM block. The rules enforced
+// here, and only here:
+//   * the alphabet is A-Z a-z 0-9 '+' '/'; every other character is invalid
+//     ('-' is deliberately outside the alphabet, so a PEM boundary that
+//     reaches the decoder fails here rather than being consumed);
+//   * the stream is a whole number of 4-character quanta;
+//   * '=' padding is legal only as the conventional "xx==" / "xxx=" tail of
+//     the final quantum, no quantum may follow a padded one, and the unused
+//     bits of the last data character must be zero -- non-canonical encodings
+//     are rejected, never repaired;
+//   * the decoded payload is at least one byte.
+// Each quantum is decoded the moment its fourth character arrives, so no
+// base64 text is ever accumulated; memory use tracks the decoded payload
+// only.
+class StrictBase64Decoder {
+public:
+    bool feed(unsigned char c) {
+        quantum_[quantumLen_++] = c;
+        if (quantumLen_ < 4) {
+            return true;  // wait for the rest of the quantum
+        }
+        quantumLen_ = 0;
+        return decodeQuantum();
+    }
+
+    // At end of input the stream must have ended on a quantum boundary and
+    // must decode to at least one byte.
+    bool finish() const {
+        return quantumLen_ == 0 && !decoded_.empty();
+    }
+
+    // Valid only after finish() succeeded: the decoded payload bytes.
+    const std::vector<unsigned char>& decoded() const { return decoded_; }
+
+private:
+    static int valueOf(unsigned char c) {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    }
+
+    // Decodes one assembled quantum, enforcing the padding and canonical-bit
+    // rules. Decoding is strict and canonical, quantum by quantum.
+    bool decodeQuantum() {
+        const int a = valueOf(quantum_[0]);
+        const int b = valueOf(quantum_[1]);
+        if (a < 0 || b < 0) {
+            return false;
+        }
+
+        const bool pad2 = quantum_[2] == '=';
+        const bool pad3 = quantum_[3] == '=';
+        if (sawPadding_) {
+            return false;  // no complete quantum may follow a padded one
+        }
+
+        if (pad2) {
+            if (!pad3) {
+                return false;  // '=' at position 2 requires one at position 3
+            }
+            if ((b & 0x0f) != 0) {
+                return false;  // non-canonical: unused padding bits must be 0
+            }
+            decoded_.push_back(
+                static_cast<unsigned char>((a << 2) | (b >> 4)));
+            sawPadding_ = true;
+        } else {
+            const int cv = valueOf(quantum_[2]);
+            if (cv < 0) {
+                return false;
+            }
+            if (pad3) {
+                if ((cv & 0x03) != 0) {
+                    return false;  // non-canonical: unused padding bits must be 0
+                }
+                decoded_.push_back(
+                    static_cast<unsigned char>((a << 2) | (b >> 4)));
+                decoded_.push_back(static_cast<unsigned char>(
+                    ((b & 0x0f) << 4) | (cv >> 2)));
+                sawPadding_ = true;
+            } else {
+                const int d = valueOf(quantum_[3]);
+                if (d < 0) {
+                    return false;
+                }
+                decoded_.push_back(
+                    static_cast<unsigned char>((a << 2) | (b >> 4)));
+                decoded_.push_back(static_cast<unsigned char>(
+                    ((b & 0x0f) << 4) | (cv >> 2)));
+                decoded_.push_back(static_cast<unsigned char>(
+                    ((cv & 0x03) << 6) | d));
+            }
+        }
+        return true;
+    }
+
+    unsigned char quantum_[4] = {};
+    size_t quantumLen_ = 0;
+    bool sawPadding_ = false;  // a padded (final) quantum already occurred
+    std::vector<unsigned char> decoded_;
+};
+
+// --- Layer 2: PEM text structure --------------------------------------------
+//
 // Streaming parser for the strict single-block PEM structure used by key-id:
 //
 //   [ASCII ws] -----BEGIN PUBLIC KEY----- LF/CRLF
-//   (base64 lines; no blank or whitespace-only lines) ...
+//   (payload lines; no blank or whitespace-only lines) ...
 //   -----END PUBLIC KEY-----
 //   [ASCII ws]
 //
@@ -247,88 +374,20 @@ private:
 // no requirement that the first such byte be a line feed.
 //
 // Bytes are fed straight from the read passes, chunk by chunk, and nothing is
-// retained besides the fixed-size parser state and the decoded payload: the
-// surrounding whitespace is merely classified and discarded, and each base64
-// quantum is decoded the moment its fourth character arrives, so no base64
-// text is ever accumulated. Memory use therefore depends on the size of the
-// encoded public key itself, not on the amount of whitespace around the block
-// or on the file size; no file-size limit is imposed.
+// retained besides the fixed-size parser state and the decoder's payload: the
+// surrounding whitespace is merely classified and discarded, and every
+// payload character is forwarded to the StrictBase64Decoder the moment it
+// arrives. Memory use therefore depends on the size of the encoded public key
+// itself, not on the amount of whitespace around the block or on the file
+// size; no file-size limit is imposed.
 //
 // Anything outside the grammar above fails deterministically: non-whitespace
 // outside the block, more than one block, any other PEM label (private keys,
-// certificates, PKCS#1 RSA public keys, ...), malformed or truncated base64.
-// finish() additionally verifies that the decoded payload is one complete,
-// canonical DER SubjectPublicKeyInfo understood by the crypto library, so
-// non-DER BER encodings and trailing bytes are rejected as well.
-class PublicKeyPemSink {
+// certificates, PKCS#1 RSA public keys, ...). Whether the payload characters
+// themselves are well-formed base64 is the decoder's concern, not this
+// parser's.
+class PublicKeyPemParser {
 public:
-    explicit PublicKeyPemSink(const char* pathArg) : pathArg_(pathArg) {}
-
-    bool start() { return true; }
-
-    bool consume(const char* data, size_t size) {
-        if (failed_) {
-            return false;  // stay failed across the rest of the file
-        }
-        for (size_t i = 0; i < size; ++i) {
-            if (!feed(static_cast<unsigned char>(data[i]))) {
-                failed_ = true;
-                reportInvalid();
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool finish() {
-        if (failed_) {
-            return false;  // consume() already reported the reason
-        }
-        bool ok = false;
-        switch (phase_) {
-            case Phase::kEndMarker:
-                // A fully matched END marker needs no trailing whitespace or
-                // line feed at EOF; an unfinished match is a truncated marker.
-                ok = markerMatched_ == kPemEnd.size();
-                break;
-            case Phase::kPostamble:
-                // Complete marker already followed by at least one whitespace
-                // byte; everything remaining was whitespace as well.
-                ok = true;
-                break;
-            case Phase::kPreamble:       // empty or whitespace-only file
-            case Phase::kBeginMarker:    // truncated BEGIN line
-            case Phase::kBeginCr:        // CR in the header not followed by LF
-            case Phase::kBodyLineStart:
-            case Phase::kBodyData:
-            case Phase::kBodyCr:         // truncated: no END line
-                break;
-        }
-        if (ok) {
-            ok = flushQuantumAtEnd() && validateSpkiDer();
-        }
-        if (!ok) {
-            failed_ = true;
-            reportInvalid();
-        }
-        return ok;
-    }
-
-    // Valid only after finish() succeeded: the canonical SPKI DER.
-    const std::vector<unsigned char>& spkiDer() const { return der_; }
-
-private:
-    enum class Phase {
-        kPreamble,
-        kBeginMarker,
-        kBeginCr,
-        kBodyLineStart,
-        kBodyData,
-        kBodyCr,
-        kEndMarker,
-        kPostamble,
-    };
-
     bool feed(unsigned char c) {
         switch (phase_) {
             case Phase::kPreamble:
@@ -377,7 +436,7 @@ private:
                 if (isAsciiSpace(c)) {
                     return false;  // whitespace is allowed only around it
                 }
-                return feedBase64Data(c);
+                return feedPayloadChar(c);
 
             case Phase::kBodyData:
                 if (c == '\n') {
@@ -398,7 +457,7 @@ private:
                 if (isAsciiSpace(c)) {
                     return false;
                 }
-                return feedBase64Data(c);
+                return feedPayloadChar(c);
 
             case Phase::kBodyCr:
                 // Bare CRs are not line separators: a CR must end with LF.
@@ -437,6 +496,50 @@ private:
         return false;
     }
 
+    // At end of input the text structure must be complete -- a fully matched
+    // END marker, with or without trailing whitespace -- and the payload
+    // stream must satisfy the decoder's own end-of-input rules.
+    bool finish() const {
+        bool structureComplete = false;
+        switch (phase_) {
+            case Phase::kEndMarker:
+                // A fully matched END marker needs no trailing whitespace or
+                // line feed at EOF; an unfinished match is a truncated marker.
+                structureComplete = markerMatched_ == kPemEnd.size();
+                break;
+            case Phase::kPostamble:
+                // Complete marker already followed by at least one whitespace
+                // byte; everything remaining was whitespace as well.
+                structureComplete = true;
+                break;
+            case Phase::kPreamble:       // empty or whitespace-only file
+            case Phase::kBeginMarker:    // truncated BEGIN line
+            case Phase::kBeginCr:        // CR in the header not followed by LF
+            case Phase::kBodyLineStart:
+            case Phase::kBodyData:
+            case Phase::kBodyCr:         // truncated: no END line
+                break;
+        }
+        return structureComplete && decoder_.finish();
+    }
+
+    // Valid only after finish() succeeded: the decoded payload bytes.
+    const std::vector<unsigned char>& payload() const {
+        return decoder_.decoded();
+    }
+
+private:
+    enum class Phase {
+        kPreamble,
+        kBeginMarker,
+        kBeginCr,
+        kBodyLineStart,
+        kBodyData,
+        kBodyCr,
+        kEndMarker,
+        kPostamble,
+    };
+
     bool beginComplete() {
         phase_ = Phase::kBodyLineStart;
         lineEmpty_ = true;
@@ -448,138 +551,106 @@ private:
         return true;
     }
 
-    static int base64Value(unsigned char c) {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    }
-
-    // Feeds one character of a payload line. '-' is deliberately outside the
-    // alphabet (it starts the END marker, handled by the caller), so any other
-    // PEM boundary fails here rather than being consumed. Decoding is strict
-    // and canonical, quantum by quantum; padding is legal only as the
-    // conventional "x=" / "xx==" tail of the stream, and its unused bits must
-    // be zero. This mirrors the former whole-file decoder exactly.
-    bool feedBase64Data(unsigned char c) {
+    // Hands one payload character to the decoder. The parser only records its
+    // own line state; every encoding rule lives in the decoder.
+    bool feedPayloadChar(unsigned char c) {
         phase_ = Phase::kBodyData;
         lineEmpty_ = false;
+        return decoder_.feed(c);
+    }
 
-        quantum_[quantumLen_++] = c;
-        if (quantumLen_ < 4) {
-            return true;  // wait for the rest of the quantum
+    Phase phase_ = Phase::kPreamble;
+    size_t markerMatched_ = 0;  // prefix length of the marker being matched
+    bool lineEmpty_ = true;     // current body line has seen no data yet
+    StrictBase64Decoder decoder_;
+};
+
+// --- Layer 3: canonical SubjectPublicKeyInfo DER ----------------------------
+//
+// Validates that a decoded payload is one complete SubjectPublicKeyInfo DER
+// structure covering every byte, understood by the crypto library, and in
+// canonical encoding. Re-encoding the parsed structure must reproduce the
+// payload byte for byte; that round trip rules out non-DER BER encodings and
+// other representations OpenSSL might otherwise accept, without normalizing
+// anything first. The bytes hashed for the fingerprint are therefore the
+// canonical SPKI DER, so PEM line wrapping and line endings never influence
+// the result.
+bool isCanonicalSpkiDer(const std::vector<unsigned char>& der) {
+    const unsigned char* p = der.data();
+    const std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+        d2i_PUBKEY_ex(nullptr, &p, static_cast<long>(der.size()), nullptr,
+                      nullptr),
+        &EVP_PKEY_free);
+    if (!pkey) {
+        return false;
+    }
+    if (p - der.data() != static_cast<ptrdiff_t>(der.size())) {
+        return false;  // trailing bytes after the SPKI structure
+    }
+
+    const int encLen = i2d_PUBKEY(pkey.get(), nullptr);
+    if (encLen <= 0 || static_cast<size_t>(encLen) != der.size()) {
+        return false;
+    }
+    std::vector<unsigned char> reencoded(static_cast<size_t>(encLen));
+    unsigned char* q = reencoded.data();
+    if (i2d_PUBKEY(pkey.get(), &q) != encLen || reencoded != der) {
+        return false;  // non-canonical DER
+    }
+    return true;
+}
+
+// ByteSink adapter for key-id: feeds the file bytes to the PEM parser chunk
+// by chunk, applies the DER validation once the text and encoding layers have
+// accepted the input, and reports every content failure in one place.
+class PublicKeyPemSink {
+public:
+    explicit PublicKeyPemSink(const char* pathArg) : pathArg_(pathArg) {}
+
+    bool start() { return true; }
+
+    bool consume(const char* data, size_t size) {
+        if (failed_) {
+            return false;  // stay failed across the rest of the file
         }
-        quantumLen_ = 0;
-
-        const int a = base64Value(quantum_[0]);
-        const int b = base64Value(quantum_[1]);
-        if (a < 0 || b < 0) {
-            return false;
-        }
-
-        const bool pad2 = quantum_[2] == '=';
-        const bool pad3 = quantum_[3] == '=';
-        if (sawPadding_) {
-            return false;  // no complete quantum may follow a padded one
-        }
-
-        if (pad2) {
-            if (!pad3) {
-                return false;  // '=' at position 2 requires one at position 3
-            }
-            if ((b & 0x0f) != 0) {
-                return false;  // non-canonical: unused padding bits must be 0
-            }
-            der_.push_back(static_cast<unsigned char>((a << 2) | (b >> 4)));
-            sawPadding_ = true;
-        } else {
-            const int cv = base64Value(quantum_[2]);
-            if (cv < 0) {
+        for (size_t i = 0; i < size; ++i) {
+            if (!parser_.feed(static_cast<unsigned char>(data[i]))) {
+                failed_ = true;
+                reportInvalid();
                 return false;
             }
-            if (pad3) {
-                if ((cv & 0x03) != 0) {
-                    return false;  // non-canonical: unused padding bits must be 0
-                }
-                der_.push_back(
-                    static_cast<unsigned char>((a << 2) | (b >> 4)));
-                der_.push_back(static_cast<unsigned char>(
-                    ((b & 0x0f) << 4) | (cv >> 2)));
-                sawPadding_ = true;
-            } else {
-                const int d = base64Value(quantum_[3]);
-                if (d < 0) {
-                    return false;
-                }
-                der_.push_back(
-                    static_cast<unsigned char>((a << 2) | (b >> 4)));
-                der_.push_back(static_cast<unsigned char>(
-                    ((b & 0x0f) << 4) | (cv >> 2)));
-                der_.push_back(static_cast<unsigned char>(
-                    ((cv & 0x03) << 6) | d));
-            }
         }
         return true;
     }
 
-    // At EOF the payload must have ended on a quantum boundary and must
-    // decode to at least one byte.
-    bool flushQuantumAtEnd() {
-        if (quantumLen_ != 0 || der_.empty()) {
-            return false;
+    bool finish() {
+        if (failed_) {
+            return false;  // consume() already reported the reason
         }
-        return true;
+        const bool ok =
+            parser_.finish() && isCanonicalSpkiDer(parser_.payload());
+        if (!ok) {
+            failed_ = true;
+            reportInvalid();
+        }
+        return ok;
     }
 
-    // Validates that the decoded payload is one complete SubjectPublicKeyInfo
-    // DER structure covering every byte, understood by the crypto library, and
-    // in canonical encoding. Re-encoding the parsed structure must reproduce
-    // the payload byte for byte; that round trip rules out non-DER BER
-    // encodings and other representations OpenSSL might otherwise accept. The
-    // bytes hashed for the fingerprint are therefore the canonical SPKI DER,
-    // so PEM line wrapping and line endings never influence the result.
-    bool validateSpkiDer() {
-        const unsigned char* p = der_.data();
-        const std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
-            d2i_PUBKEY_ex(nullptr, &p, static_cast<long>(der_.size()), nullptr,
-                          nullptr),
-            &EVP_PKEY_free);
-        if (!pkey) {
-            return false;
-        }
-        if (p - der_.data() != static_cast<ptrdiff_t>(der_.size())) {
-            return false;  // trailing bytes after the SPKI structure
-        }
-
-        const int encLen = i2d_PUBKEY(pkey.get(), nullptr);
-        if (encLen <= 0 || static_cast<size_t>(encLen) != der_.size()) {
-            return false;
-        }
-        std::vector<unsigned char> reencoded(static_cast<size_t>(encLen));
-        unsigned char* q = reencoded.data();
-        if (i2d_PUBKEY(pkey.get(), &q) != encLen || reencoded != der_) {
-            return false;  // non-canonical DER
-        }
-        return true;
+    // Valid only after finish() succeeded: the canonical SPKI DER.
+    const std::vector<unsigned char>& spkiDer() const {
+        return parser_.payload();
     }
 
+private:
     void reportInvalid() const {
         std::cerr << "sealmark: '" << pathArg_
                   << "' does not contain a single valid PEM-encoded "
                      "SubjectPublicKeyInfo public key (PUBLIC KEY)\n";
     }
 
-    Phase phase_ = Phase::kPreamble;
-    size_t markerMatched_ = 0;  // prefix length of the marker being matched
-    bool lineEmpty_ = true;     // current body line has seen no data yet
-    unsigned char quantum_[4] = {};
-    size_t quantumLen_ = 0;
-    bool sawPadding_ = false;  // a padded (final) quantum already occurred
+    PublicKeyPemParser parser_;
     bool failed_ = false;
     const char* pathArg_ = nullptr;
-    std::vector<unsigned char> der_;
 };
 
 // Renders bytes as lowercase hexadecimal with no separators or prefix.
